@@ -9,18 +9,7 @@ from typing import Any, Dict, Hashable, List, Optional, Tuple, Union
 import dask.array as da
 import numpy as np
 import xarray as xr
-from bioio_base import constants, exceptions
-from bioio_base import io as io_utils
-from bioio_base import transforms, types
-from bioio_base.dimensions import (
-    DEFAULT_CHUNK_DIMS,
-    DEFAULT_DIMENSION_ORDER_LIST,
-    DEFAULT_DIMENSION_ORDER_LIST_WITH_MOSAIC_TILES,
-    REQUIRED_CHUNK_DIMS,
-    DimensionNames,
-    Dimensions,
-)
-from bioio_base.reader import Reader as BaseReader
+from bioio_base import constants, dimensions, exceptions, io, reader, transforms, types
 from dask import delayed
 from fsspec.spec import AbstractFileSystem
 from readlif.reader import LifFile
@@ -28,7 +17,7 @@ from readlif.reader import LifFile
 ###############################################################################
 
 
-class Reader(BaseReader):
+class Reader(reader.Reader):
     """
     Wraps the readlif API to provide a bioio reader plugin for
     volumetric LIF images.
@@ -39,14 +28,23 @@ class Reader(BaseReader):
         Path to image file to construct Reader for.
     chunk_dims: Union[str, List[str]]
         Which dimensions to create chunks for.
-        Default: DEFAULT_CHUNK_DIMS
-        Note: Dimensions.SpatialY, Dimensions.SpatialX, and DimensionNames.Samples,
-        will always be added to the list if not present during dask array
-        construction.
+        Default: dimensions.DEFAULT_CHUNK_DIMS
+        Note: Dimensions.SpatialY, Dimensions.SpatialX, and
+        dimensions.DimensionNames.Samples, will always be added
+        to the list if not present during dask array construction.
     fs_kwargs: Dict[str, Any]
         Any specific keyword arguments to pass down to the fsspec created filesystem.
         Default: {}
-
+    is_x_flipped: bool, default = False
+        If True, the respective dimension will be
+        flipped along the other axis.
+    is_y_flipped: bool, default = False
+        If True, the respective dimension will be
+        flipped along the other axis.
+    is_x_and_y_swapped:bool, default = True
+        If `is_x_and_y_swapped` is True, the field_x and field_y given
+        from the mosaic_position will be swapped such that field_x represents y
+        and field_y represents x.
     Notes
     -----
     To use this reader, install with: `pip install readlif>=0.6.4`.
@@ -58,7 +56,7 @@ class Reader(BaseReader):
     _xarray_data: Optional["xr.DataArray"] = None
     _mosaic_xarray_dask_data: Optional["xr.DataArray"] = None
     _mosaic_xarray_data: Optional["xr.DataArray"] = None
-    _dims: Optional[Dimensions] = None
+    _dims: Optional[dimensions.Dimensions] = None
     _metadata: Optional[Any] = None
     _scenes: Optional[Tuple[str, ...]] = None
     _current_scene_index: int = 0
@@ -80,14 +78,14 @@ class Reader(BaseReader):
     def __init__(
         self,
         image: types.PathLike,
-        chunk_dims: Union[str, List[str]] = DEFAULT_CHUNK_DIMS,
+        chunk_dims: Union[str, List[str]] = dimensions.DEFAULT_CHUNK_DIMS,
         fs_kwargs: Dict[str, Any] = {},
         is_x_flipped: bool = False,
         is_y_flipped: bool = False,
         is_x_and_y_swapped: bool = True,
     ):
         # Expand details of provided image
-        self._fs, self._path = io_utils.pathlike_to_fs(
+        self._fs, self._path = io.pathlike_to_fs(
             image,
             enforce_exists=True,
             fs_kwargs=fs_kwargs,
@@ -177,18 +175,21 @@ class Reader(BaseReader):
             retrieve_shape: List[int] = []
             use_selected_or_np_map: Dict[str, int] = {}
             for dim, index_op in zip(retrieve_dims, retrieve_indices):
-                if dim not in [DimensionNames.SpatialY, DimensionNames.SpatialX]:
+                if dim not in [
+                    dimensions.DimensionNames.SpatialY,
+                    dimensions.DimensionNames.SpatialX,
+                ]:
                     # Handle slices
                     if index_op is None:
                         # Store the dim for later to inform to use the np index
                         use_selected_or_np_map[dim] = MISSING_DIM_SENTINAL_VALUE
-                        if dim == DimensionNames.MosaicTile:
+                        if dim == dimensions.DimensionNames.MosaicTile:
                             retrieve_shape.append(selected_scene.n_mosaic)
-                        elif dim == DimensionNames.Time:
+                        elif dim == dimensions.DimensionNames.Time:
                             retrieve_shape.append(selected_scene.nt)
-                        elif dim == DimensionNames.Channel:
+                        elif dim == dimensions.DimensionNames.Channel:
                             retrieve_shape.append(selected_scene.channels)
-                        elif dim == DimensionNames.SpatialZ:
+                        elif dim == dimensions.DimensionNames.SpatialZ:
                             retrieve_shape.append(selected_scene.nz)
 
                     # Handle non-chunk dimensions (specific indices / ints)
@@ -208,51 +209,57 @@ class Reader(BaseReader):
                 plane_indices: Dict[str, int] = {}
 
                 # Handle MosaicTile
-                if DimensionNames.MosaicTile in use_selected_or_np_map:
+                if dimensions.DimensionNames.MosaicTile in use_selected_or_np_map:
                     if (
-                        use_selected_or_np_map[DimensionNames.MosaicTile]
+                        use_selected_or_np_map[dimensions.DimensionNames.MosaicTile]
                         == MISSING_DIM_SENTINAL_VALUE
                     ):
                         plane_indices["m"] = np_index[
-                            retrieve_dims.index(DimensionNames.MosaicTile)
+                            retrieve_dims.index(dimensions.DimensionNames.MosaicTile)
                         ]
                     else:
                         plane_indices["m"] = use_selected_or_np_map[
-                            DimensionNames.MosaicTile
+                            dimensions.DimensionNames.MosaicTile
                         ]
 
                 # Handle Time
                 if (
-                    use_selected_or_np_map[DimensionNames.Time]
+                    use_selected_or_np_map[dimensions.DimensionNames.Time]
                     == MISSING_DIM_SENTINAL_VALUE
                 ):
                     plane_indices["t"] = np_index[
-                        retrieve_dims.index(DimensionNames.Time)
+                        retrieve_dims.index(dimensions.DimensionNames.Time)
                     ]
                 else:
-                    plane_indices["t"] = use_selected_or_np_map[DimensionNames.Time]
+                    plane_indices["t"] = use_selected_or_np_map[
+                        dimensions.DimensionNames.Time
+                    ]
 
                 # Handle Channels
                 if (
-                    use_selected_or_np_map[DimensionNames.Channel]
+                    use_selected_or_np_map[dimensions.DimensionNames.Channel]
                     == MISSING_DIM_SENTINAL_VALUE
                 ):
                     plane_indices["c"] = np_index[
-                        retrieve_dims.index(DimensionNames.Channel)
+                        retrieve_dims.index(dimensions.DimensionNames.Channel)
                     ]
                 else:
-                    plane_indices["c"] = use_selected_or_np_map[DimensionNames.Channel]
+                    plane_indices["c"] = use_selected_or_np_map[
+                        dimensions.DimensionNames.Channel
+                    ]
 
                 # Handle SpatialZ
                 if (
-                    use_selected_or_np_map[DimensionNames.SpatialZ]
+                    use_selected_or_np_map[dimensions.DimensionNames.SpatialZ]
                     == MISSING_DIM_SENTINAL_VALUE
                 ):
                     plane_indices["z"] = np_index[
-                        retrieve_dims.index(DimensionNames.SpatialZ)
+                        retrieve_dims.index(dimensions.DimensionNames.SpatialZ)
                     ]
                 else:
-                    plane_indices["z"] = use_selected_or_np_map[DimensionNames.SpatialZ]
+                    plane_indices["z"] = use_selected_or_np_map[
+                        dimensions.DimensionNames.SpatialZ
+                    ]
 
                 # Append the retrieved plane as a numpy array
                 planes.append(np.asarray(selected_scene.get_frame(**plane_indices)))
@@ -295,7 +302,7 @@ class Reader(BaseReader):
             The fully constructed and fully delayed image as a Dask Array object.
         """
         # Always add the plane dimensions if not present already
-        for dim in REQUIRED_CHUNK_DIMS:
+        for dim in dimensions.REQUIRED_CHUNK_DIMS:
             if dim not in self.chunk_dims:
                 self.chunk_dims.append(dim)
 
@@ -306,17 +313,17 @@ class Reader(BaseReader):
         selected_scene = lif.get_image(self.current_scene_index)
         selected_scene_shape: List[int] = []
         for dim in selected_scene_dims:
-            if dim == DimensionNames.MosaicTile:
+            if dim == dimensions.DimensionNames.MosaicTile:
                 selected_scene_shape.append(selected_scene.n_mosaic)
-            elif dim == DimensionNames.Time:
+            elif dim == dimensions.DimensionNames.Time:
                 selected_scene_shape.append(selected_scene.nt)
-            elif dim == DimensionNames.Channel:
+            elif dim == dimensions.DimensionNames.Channel:
                 selected_scene_shape.append(selected_scene.channels)
-            elif dim == DimensionNames.SpatialZ:
+            elif dim == dimensions.DimensionNames.SpatialZ:
                 selected_scene_shape.append(selected_scene.nz)
-            elif dim == DimensionNames.SpatialY:
+            elif dim == dimensions.DimensionNames.SpatialY:
                 selected_scene_shape.append(selected_scene.info["dims"].y)
-            elif dim == DimensionNames.SpatialX:
+            elif dim == dimensions.DimensionNames.SpatialX:
                 selected_scene_shape.append(selected_scene.info["dims"].x)
 
         # Get sample for dtype
@@ -419,7 +426,7 @@ class Reader(BaseReader):
                 scene_channel_list.append(f"{channel.attrib['LUTName']}")
 
         # Attach channel names to coords
-        coords[DimensionNames.Channel] = scene_channel_list
+        coords[dimensions.DimensionNames.Channel] = scene_channel_list
 
         # Unpack short info scales
         scale_x, scale_y, scale_z, scale_t = image_short_info["scale"]
@@ -432,21 +439,21 @@ class Reader(BaseReader):
 
         # Handle Spatial Dimensions
         if scale_z is not None:
-            coords[DimensionNames.SpatialZ] = Reader._generate_coord_array(
+            coords[dimensions.DimensionNames.SpatialZ] = Reader._generate_coord_array(
                 0, image_short_info["dims"].z, scale_z
             )
         if scale_y is not None:
-            coords[DimensionNames.SpatialY] = Reader._generate_coord_array(
+            coords[dimensions.DimensionNames.SpatialY] = Reader._generate_coord_array(
                 0, image_short_info["dims"].y, scale_y
             )
         if scale_x is not None:
-            coords[DimensionNames.SpatialX] = Reader._generate_coord_array(
+            coords[dimensions.DimensionNames.SpatialX] = Reader._generate_coord_array(
                 0, image_short_info["dims"].x, scale_x
             )
 
         # Time
         if scale_t is not None:
-            coords[DimensionNames.Time] = Reader._generate_coord_array(
+            coords[dimensions.DimensionNames.Time] = Reader._generate_coord_array(
                 0, image_short_info["dims"].t, scale_t
             )
 
@@ -480,11 +487,11 @@ class Reader(BaseReader):
 
             # If there are tiles in the image use mosaic dims
             if len(tile_positions) > 0:
-                dims = DEFAULT_DIMENSION_ORDER_LIST_WITH_MOSAIC_TILES
+                dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST_WITH_MOSAIC_TILES
 
             # Otherwise use standard dims
             else:
-                dims = DEFAULT_DIMENSION_ORDER_LIST
+                dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST
 
             # Get image data
             image_data = self._create_dask_array(lif, dims)
@@ -534,11 +541,11 @@ class Reader(BaseReader):
 
             # If there are tiles in the image use mosaic dims
             if len(tile_positions) > 0:
-                dims = DEFAULT_DIMENSION_ORDER_LIST_WITH_MOSAIC_TILES
+                dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST_WITH_MOSAIC_TILES
 
             # Otherwise use standard dims
             else:
-                dims = DEFAULT_DIMENSION_ORDER_LIST
+                dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST
 
             # Get image data
             image_data = self._get_image_data(
@@ -604,7 +611,7 @@ class Reader(BaseReader):
             tile = transforms.reshape_data(
                 data,
                 given_dims=dims,
-                return_dims=dims.replace(DimensionNames.MosaicTile, ""),
+                return_dims=dims.replace(dimensions.DimensionNames.MosaicTile, ""),
                 M=tile_index,
             )
 
@@ -653,16 +660,18 @@ class Reader(BaseReader):
 
         # Copy metadata
         dims = [
-            d for d in self.xarray_dask_data.dims if d is not DimensionNames.MosaicTile
+            d
+            for d in self.xarray_dask_data.dims
+            if d is not dimensions.DimensionNames.MosaicTile
         ]
         coords: Dict[Hashable, Any] = {
             d: v
             for d, v in self.xarray_dask_data.coords.items()
             if d
             not in [
-                DimensionNames.MosaicTile,
-                DimensionNames.SpatialY,
-                DimensionNames.SpatialX,
+                dimensions.DimensionNames.MosaicTile,
+                dimensions.DimensionNames.SpatialY,
+                dimensions.DimensionNames.SpatialX,
             ]
         }
 
@@ -672,11 +681,11 @@ class Reader(BaseReader):
         scale_y = 1 / scale_y if scale_y is not None else None
 
         if scale_y is not None:
-            coords[DimensionNames.SpatialY] = Reader._generate_coord_array(
+            coords[dimensions.DimensionNames.SpatialY] = Reader._generate_coord_array(
                 0, stitched.shape[-2], scale_y
             )
         if scale_x is not None:
-            coords[DimensionNames.SpatialX] = Reader._generate_coord_array(
+            coords[dimensions.DimensionNames.SpatialX] = Reader._generate_coord_array(
                 0, stitched.shape[-1], scale_x
             )
 
@@ -789,7 +798,7 @@ class Reader(BaseReader):
         IndexError
             No matching mosaic tile index found.
         """
-        if DimensionNames.MosaicTile not in self.dims.order:
+        if dimensions.DimensionNames.MosaicTile not in self.dims.order:
             raise exceptions.UnexpectedShapeError("No mosaic dimension in image.")
 
         if kwargs:
@@ -848,7 +857,7 @@ class Reader(BaseReader):
         NotImplementedError
             This reader does not support indexing tiles by dimensions other than M
         """
-        if DimensionNames.MosaicTile not in self.dims.order:
+        if dimensions.DimensionNames.MosaicTile not in self.dims.order:
             raise exceptions.UnexpectedShapeError("No mosaic dimension in image.")
 
         if kwargs:
