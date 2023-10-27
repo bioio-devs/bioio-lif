@@ -1,7 +1,7 @@
 # bioio-lif
 
-[![Build Status](https://github.com/bioio-devs/bioio-lif/workflows/CI/badge.svg)](https://github.com/bioio-devs/bioio-lif/actions)
-[![Documentation](https://github.com/bioio-devs/bioio-lif/workflows/Documentation/badge.svg)](https://bioio-devs.github.io/bioio-lif)
+[![Build Status](https://github.com/bioio-devs/bioio-lif/actions/workflows/ci.yml/badge.svg)](https://github.com/bioio-devs/bioio-lif/actions)
+[![Documentation](https://github.com/bioio-devs/bioio-lif/actions/workflows/docs.yml/badge.svg)](https://bioio-devs.github.io/bioio-lif)
 
 A BioIO reader plugin for reading LIF (Leica Image File) images.
 
