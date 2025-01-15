@@ -58,6 +58,7 @@ class Reader(reader.Reader):
     _mosaic_xarray_data: Optional["xr.DataArray"] = None
     _dims: Optional[dimensions.Dimensions] = None
     _metadata: Optional[Any] = None
+    _physical_pixel_sizes: Optional[types.PhysicalPixelSizes] = None
     _scenes: Optional[Tuple[str, ...]] = None
     _current_scene_index: int = 0
     # Do not provide default value because
@@ -115,7 +116,6 @@ class Reader(reader.Reader):
 
         # Delayed storage
         self._scene_short_info: Dict[str, Any] = {}
-        self._px_sizes: Optional[types.PhysicalPixelSizes] = None
 
         # Enforce valid image
         if not self._is_supported_image(self._fs, self._path):
@@ -507,7 +507,7 @@ class Reader(reader.Reader):
             )
 
             # Store pixel sizes
-            self._px_sizes = px_sizes
+            self._physical_pixel_sizes = px_sizes
 
             return xr.DataArray(
                 image_data,
@@ -567,7 +567,7 @@ class Reader(reader.Reader):
             )
 
             # Store pixel sizes
-            self._px_sizes = px_sizes
+            self._physical_pixel_sizes = px_sizes
 
             return xr.DataArray(
                 image_data,
@@ -755,15 +755,15 @@ class Reader(reader.Reader):
         We currently do not handle unit attachment to these values. Please see the file
         metadata for unit information.
         """
-        if self._px_sizes is None:
+        if self._physical_pixel_sizes is None:
             # We get pixel sizes as a part of array construct
             # so simply run array construct
             self.dask_data
 
-        if self._px_sizes is None:
+        if self._physical_pixel_sizes is None:
             raise ValueError("Pixel sizes weren't created as a part of image reading")
 
-        return self._px_sizes
+        return self._physical_pixel_sizes
 
     def get_mosaic_tile_position(
         self, mosaic_tile_index: int, **kwargs: int
