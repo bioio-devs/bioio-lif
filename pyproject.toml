@@ -33,8 +33,7 @@ dependencies = [
   "fsspec>=2022.8.0",
   "numpy>=1.16",
   "PyYAML>=6.0",
-  "readlif>=0.6.4",
-  "xarray>=0.16.1",
+  "xarray>=0.16.1", "readlif @ https://github.com/Arcadia-Science/readlif.git",
 ]
 
 [project.urls]
@@ -116,3 +115,16 @@ min-python-version = "3.10.0"
 per-file-ignores = [
   "__init__.py:F401",
 ]
+[tool.pixi.project]
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[tool.pixi.pypi-dependencies]
+bioio-lif = { path = ".", editable = true }
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+lint = { features = ["lint"], solve-group = "default" }
+test = { features = ["test"], solve-group = "default" }
+
+[tool.pixi.tasks]
