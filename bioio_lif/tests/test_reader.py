@@ -25,6 +25,16 @@ from .conftest import LOCAL_RESOURCES_DIR
     "expected_physical_pixel_sizes",
     [
         (
+            "20250130_4Channels_5planes.lif",
+            "Series001",
+            ("Series001",),
+            (1, 4, 5, 256, 256),
+            np.uint16,
+            dimensions.DEFAULT_DIMENSION_ORDER,
+            ["Blue", "Cyan", "Green", "Yellow"],
+            (-21.23358, 6.078431372549019, 6.078431372549019),
+        ),
+        (
             "s_1_t_1_c_2_z_1.lif",
             "PEI_laminin_35k",
             ("PEI_laminin_35k",),
@@ -109,7 +119,7 @@ def test_lif_reader(
     )
 
 
-@pytest.mark.parametrize("filename", ["s_1_t_1_c_2_z_1.lif", "s_1_t_4_c_2_z_1.lif"])
+@pytest.mark.parametrize("filename", ["s_1_t_1_c_2_z_1.lif", "s_1_t_4_c_2_z_1.lif", "20250130_4Channels_5planes.lif"])
 @pytest.mark.parametrize("chunk_dims", ["ZYX", "TYX", "CYX"])
 @pytest.mark.parametrize("get_dims", ["ZYX", "TYX"])
 def test_sanity_check_correct_indexing(
@@ -123,6 +133,8 @@ def test_sanity_check_correct_indexing(
     # Construct reader
     reader = Reader(uri, chunk_dims=chunk_dims, is_x_and_y_swapped=True)
     lif_img = LifFile(uri).get_image(0)
+    # This needs to be set to False before https://github.com/Arcadia-Science/readlif/pull/52 
+    lif_img.channel_as_second_dim = False
 
     # Pull a chunk from LifReader
     chunk_from_lif_reader = reader.get_image_dask_data(get_dims).compute()
