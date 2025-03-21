@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import datetime
 import xml.etree.ElementTree as ET
 from copy import copy
 from math import floor
@@ -13,6 +14,8 @@ from bioio_base import constants, dimensions, exceptions, io, reader, transforms
 from dask import delayed
 from fsspec.spec import AbstractFileSystem
 from readlif.reader import LifFile
+
+from .metadata_labels import MetadataLabels
 
 ###############################################################################
 
@@ -894,3 +897,84 @@ class Reader(reader.Reader):
             )
 
         return adjusted_mosaic_positions
+
+    # --- Embedded metadata properties for the manifest ---
+    @staticmethod
+    def _convert_lif_timestamp(hex_timestamp: str) -> datetime.datetime:
+        """
+        Converts LIF timestamp from hexadecimal Windows FILETIME format to a UTC
+        datetime.
+
+        Example: '1db3d2d696a7a10' -> datetime(2024, 11, 22, 22, 25, 18, 897001)
+        """
+        timestamp_as_complex_decimal = int(hex_timestamp, 16)
+        nanoseconds_since_filetime_epoch = timestamp_as_complex_decimal * 100
+        seconds_since_filetime_epoch = nanoseconds_since_filetime_epoch / 1e9
+        seconds_since_unix_epoch = seconds_since_filetime_epoch - 11644473600
+        return datetime.datetime.utcfromtimestamp(seconds_since_unix_epoch)
+
+    @property
+    def scene_root(self) -> ET.Element:
+        row_node = io.search_for_node(self.metadata, "Element", {"Name": self.row})
+        return io.search_for_node(row_node, "Element", {"Name": self.column})
+
+    @property
+    @reader.embedded_metadata(MetadataLabels.COLUMN.value)
+    def column(self) -> Optional[str]:
+        tilescan_info = self.current_scene.split(" ")[1].split("/")
+        col = tilescan_info[2].split("_")[0]
+        return col
+
+    @property
+    @reader.embedded_metadata(MetadataLabels.ROW.value)
+    def row(self) -> Optional[str]:
+        tilescan_info = self.current_scene.split(" ")[1].split("/")
+        row = tilescan_info[1]
+        return row
+
+    @property
+    @reader.embedded_metadata(MetadataLabels.BINNING.value)
+    def binning(self) -> str:
+        camera_format_node = io.search_for_node(self.scene_root, "CameraFormat")
+        binning = camera_format_node.get("Binning")
+        live_binning = camera_format_node.get("LiveBinning")
+        if binning == "1" and live_binning == "1":
+            return "1x1"
+        if binning == "2" and live_binning == "2":
+            return "2x2"
+        raise NotImplementedError(
+            f"Unexpected binning, found: {binning}x{live_binning}"
+        )
+
+    @property
+    @reader.embedded_metadata(MetadataLabels.OBJECTIVE.value)
+    def objective(self) -> str:
+        camera_settings_node = io.search_for_node(
+            self.scene_root, "ATLCameraSettingDefinition"
+        )
+        objective_name = camera_settings_node.get("ObjectiveName").strip()
+        if "10x/0.30" in objective_name:
+            return "10x/0.30"
+        raise NotImplementedError(f"Unexpected objective, found: {objective_name}")
+
+    @property
+    @reader.embedded_metadata(MetadataLabels.TOTAL_TIME_DURATION.value)
+    def total_time_duration(self) -> int:
+        timestamp_list_node = io.search_for_node(self.scene_root, "TimeStampList")
+        timestamps = timestamp_list_node.text.strip().split(" ")
+        total_duration_delta = self._convert_lif_timestamp(
+            timestamps[-1]
+        ) - self._convert_lif_timestamp(timestamps[0])
+        return int(total_duration_delta.total_seconds())
+
+    @property
+    @reader.embedded_metadata(MetadataLabels.IMAGING_DATE.value)
+    def imaging_date(self) -> datetime.datetime:
+        timestamp_list_node = io.search_for_node(self.metadata, "TimeStampList")
+        timestamps = timestamp_list_node.text.strip().split(" ")
+        return self._convert_lif_timestamp(timestamps[0])
+
+    @property
+    @reader.embedded_metadata(MetadataLabels.POSITION_INDEX.value)
+    def position_index(self) -> str:
+        return self.current_scene.split(" ")[1]
