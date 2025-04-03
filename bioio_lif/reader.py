@@ -958,8 +958,11 @@ class Reader(reader.Reader):
         Optional[str]
             The column index as a string. Returns None if parsing fails.
         """
+        if self.position_index is None:
+            log.warning("position_index is None; cannot extract well column index")
+            return None
         try:
-            tilescan_info = self.current_scene.split(" ")[1].split("/")
+            tilescan_info = self.position_index.split("/")
             col = tilescan_info[2].split("_")[0]
             return col
         except Exception as exc:
@@ -976,8 +979,11 @@ class Reader(reader.Reader):
         Optional[str]
             The row index as a string. Returns None if parsing fails.
         """
+        if self.position_index is None:
+            log.warning("position_index is None; cannot extract well column index")
+            return None
         try:
-            tilescan_info = self.current_scene.split(" ")[1].split("/")
+            tilescan_info = self.position_index.split("/")
             row = tilescan_info[1]
             return row
         except Exception as exc:
