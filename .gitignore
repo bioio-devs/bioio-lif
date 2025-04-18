@@ -109,3 +109,6 @@ ENV/
 
 # VSCode
 .vscode
+# pixi environments
+.pixi
+*.egg-info
