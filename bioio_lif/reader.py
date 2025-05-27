@@ -5,6 +5,7 @@ import datetime
 import logging
 import xml.etree.ElementTree as ET
 from copy import copy
+from dataclasses import dataclass
 from math import floor
 from typing import Any, Dict, Hashable, List, Optional, Tuple, Union
 
@@ -24,6 +25,12 @@ from .io import search_for_node
 log = logging.getLogger(__name__)
 
 ###############################################################################
+
+
+@dataclass
+class WellPosition:
+    row: str
+    col: str
 
 
 class Reader(reader.Reader):
@@ -137,9 +144,7 @@ class Reader(reader.Reader):
         if self._scenes is None:
             with self._fs.open(self._path) as open_resource:
                 lif = LifFile(open_resource)
-                scene_names = [image["name"] for image in lif.image_list]
-                self._scenes = tuple(scene_names)
-
+                self._scenes = tuple(image["name"] for image in lif.image_list)
         return self._scenes
 
     @staticmethod
@@ -926,6 +931,25 @@ class Reader(reader.Reader):
         return datetime.datetime.utcfromtimestamp(seconds_since_unix_epoch)
 
     @property
+    def _scene_to_well_map(self) -> Dict[int, WellPosition]:
+        if not hasattr(self, "__scene_to_well_map"):
+            scene_to_well_map = {}
+            index = 0
+            for row_elem in self.metadata.findall(".//Element"):
+                row_name = row_elem.attrib.get("Name")
+                if not row_name or not row_name.isalpha():
+                    continue
+                for col_elem in row_elem.findall("./Children/Element"):
+                    col_name = col_elem.attrib.get("Name")
+                    if col_name:
+                        scene_to_well_map[index] = WellPosition(
+                            row=row_name.upper(), col=col_name
+                        )
+                        index += 1
+            self.__scene_to_well_map = scene_to_well_map
+        return self.__scene_to_well_map
+
+    @property
     def scene_root(self) -> ET.Element:
         """
         Returns the XML node corresponding to the current scene.
@@ -958,16 +982,12 @@ class Reader(reader.Reader):
         Optional[str]
             The column index as a string. Returns None if parsing fails.
         """
-        if self.position_index is None:
-            log.warning("position_index is None; cannot extract well column index")
-            return None
         try:
-            tilescan_info = self.position_index.split("/")
-            col = tilescan_info[2].split("_")[0]
-            return col
+            pos = self._scene_to_well_map.get(self.current_scene_index)
+            return pos.col if pos else None
         except Exception as exc:
-            log.warning("Failed to extract well column index: %s", exc, exc_info=True)
-        return None
+            log.warning("Failed to extract well column: %s", exc, exc_info=True)
+            return None
 
     @property
     def row(self) -> Optional[str]:
@@ -979,16 +999,12 @@ class Reader(reader.Reader):
         Optional[str]
             The row index as a string. Returns None if parsing fails.
         """
-        if self.position_index is None:
-            log.warning("position_index is None; cannot extract well column index")
-            return None
         try:
-            tilescan_info = self.position_index.split("/")
-            row = tilescan_info[1]
-            return row
+            pos = self._scene_to_well_map.get(self.current_scene_index)
+            return pos.row if pos else None
         except Exception as exc:
-            log.warning("Failed to extract well row index: %s", exc, exc_info=True)
-        return None
+            log.warning("Failed to extract well row: %s", exc, exc_info=True)
+            return None
 
     @property
     def binning(self) -> Optional[str]:
@@ -1097,32 +1113,6 @@ class Reader(reader.Reader):
             return None
 
     @property
-    def position_index(self) -> Optional[str]:
-        """
-        Extracts the numeric position index from the current scene name.
-
-        Returns
-        -------
-        Optional[int]
-            The numeric position index parsed from scene name (e.g. 'P5-A01' -> 5).
-            Returns None if parsing fails.
-        """
-        try:
-            return self.current_scene.split(" ")[1]
-        except (IndexError, ValueError) as exc:
-            log.warning(
-                "Failed to parse position index from '%s': %s",
-                self.current_scene,
-                exc,
-                exc_info=True,
-            )
-        except Exception as exc:
-            log.warning(
-                "Unexpected error parsing position index: %s", exc, exc_info=True
-            )
-        return None
-
-    @property
     def standard_metadata(self) -> StandardMetadata:
         """
         Return the standard metadata for this reader, updating specific fields.
@@ -1137,6 +1127,6 @@ class Reader(reader.Reader):
         metadata.objective = self.objective
         metadata.imaging_date = self.imaging_date
         metadata.total_time_duration = self.total_time_duration
-        metadata.position_index = self.position_index
+        metadata.position_index = self.current_scene_index
 
         return metadata
