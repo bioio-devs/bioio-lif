@@ -1086,7 +1086,7 @@ class Reader(reader.Reader):
             return None
 
     @property
-    def timelapse_interval(self) -> Optional[float]:
+    def timelapse_interval(self) -> types.TimeInterval:
         """
         Time between consecutive timepoints:
         """
