@@ -1,8 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import datetime
+import logging
 import xml.etree.ElementTree as ET
 from copy import copy
+from dataclasses import dataclass
 from math import floor
 from typing import Any, Dict, Hashable, List, Optional, Tuple, Union
 
@@ -10,11 +13,24 @@ import dask.array as da
 import numpy as np
 import xarray as xr
 from bioio_base import constants, dimensions, exceptions, io, reader, transforms, types
+from bioio_base.standard_metadata import StandardMetadata
 from dask import delayed
 from fsspec.spec import AbstractFileSystem
 from readlif.reader import LifFile
 
+from .io import search_for_node
+
 ###############################################################################
+
+log = logging.getLogger(__name__)
+
+###############################################################################
+
+
+@dataclass
+class WellPosition:
+    row: str
+    col: str
 
 
 class Reader(reader.Reader):
@@ -128,9 +144,7 @@ class Reader(reader.Reader):
         if self._scenes is None:
             with self._fs.open(self._path) as open_resource:
                 lif = LifFile(open_resource)
-                scene_names = [image["name"] for image in lif.image_list]
-                self._scenes = tuple(scene_names)
-
+                self._scenes = tuple(image["name"] for image in lif.image_list)
         return self._scenes
 
     @staticmethod
@@ -894,3 +908,235 @@ class Reader(reader.Reader):
             )
 
         return adjusted_mosaic_positions
+
+    @staticmethod
+    def _convert_lif_timestamp(hex_timestamp: str) -> datetime.datetime:
+        """
+        Converts a LIF hexadecimal timestamp to a UTC datetime.
+
+        Parameters
+        ----------
+        hex_timestamp : str
+            A Windows FILETIME-format timestamp in hex (e.g., '1db3d2d696a7a10').
+
+        Returns
+        -------
+        datetime.datetime
+            The corresponding UTC datetime object.
+        """
+        timestamp_as_complex_decimal = int(hex_timestamp, 16)
+        nanoseconds_since_filetime_epoch = timestamp_as_complex_decimal * 100
+        seconds_since_filetime_epoch = nanoseconds_since_filetime_epoch / 1e9
+        seconds_since_unix_epoch = seconds_since_filetime_epoch - 11644473600
+        return datetime.datetime.utcfromtimestamp(seconds_since_unix_epoch)
+
+    @property
+    def _scene_to_well_map(self) -> Dict[int, WellPosition]:
+        if not hasattr(self, "__scene_to_well_map"):
+            scene_to_well_map = {}
+            index = 0
+            for row_elem in self.metadata.findall(".//Element"):
+                row_name = row_elem.attrib.get("Name")
+                if not row_name or not row_name.isalpha():
+                    continue
+                for col_elem in row_elem.findall("./Children/Element"):
+                    col_name = col_elem.attrib.get("Name")
+                    if col_name:
+                        scene_to_well_map[index] = WellPosition(
+                            row=row_name.upper(), col=col_name
+                        )
+                        index += 1
+            self.__scene_to_well_map = scene_to_well_map
+        return self.__scene_to_well_map
+
+    @property
+    def scene_root(self) -> ET.Element:
+        """
+        Returns the XML node corresponding to the current scene.
+
+        Returns
+        -------
+        ET.Element
+            The XML element representing the scene node based on row and column.
+
+        Raises
+        ------
+        ValueError
+            If either the row or column value is missing.
+        """
+        if self.row is None or self.column is None:
+            raise ValueError(
+                "Row or column value is missing; cannot locate the scene node."
+            )
+
+        row_node = search_for_node(self.metadata, "Element", {"Name": self.row})
+        return search_for_node(row_node, "Element", {"Name": self.column})
+
+    @property
+    def column(self) -> Optional[str]:
+        """
+        Extracts the well column index from the current scene name.
+
+        Returns
+        -------
+        Optional[str]
+            The column index as a string. Returns None if parsing fails.
+        """
+        try:
+            pos = self._scene_to_well_map.get(self.current_scene_index)
+            return pos.col if pos else None
+        except Exception as exc:
+            log.warning("Failed to extract well column: %s", exc, exc_info=True)
+            return None
+
+    @property
+    def row(self) -> Optional[str]:
+        """
+        Extracts the well row index from the current scene name.
+
+        Returns
+        -------
+        Optional[str]
+            The row index as a string. Returns None if parsing fails.
+        """
+        try:
+            pos = self._scene_to_well_map.get(self.current_scene_index)
+            return pos.row if pos else None
+        except Exception as exc:
+            log.warning("Failed to extract well row: %s", exc, exc_info=True)
+            return None
+
+    @property
+    def binning(self) -> Optional[str]:
+        """
+        Extracts the binning setting from the scene metadata.
+
+        Returns
+        -------
+        Optional[str]
+            The binning setting (e.g., "1x1" or "2x2").
+            Returns None if not found or unknown.
+        """
+        try:
+            camera_format_node = search_for_node(self.scene_root, "CameraFormat")
+            binning = camera_format_node.get("Binning")
+            live_binning = camera_format_node.get("LiveBinning")
+            if binning == "1" and live_binning == "1":
+                return "1x1"
+            if binning == "2" and live_binning == "2":
+                return "2x2"
+            raise NotImplementedError(
+                f"Unexpected binning, found: {binning}x{live_binning}"
+            )
+        except Exception as exc:
+            log.warning("Failed to extract binning: %s", exc, exc_info=True)
+        return None
+
+    @property
+    def objective(self) -> Optional[str]:
+        """
+        Extracts the microscope objective magnification and NA.
+
+        Returns
+        -------
+        Optional[str]
+            The formatted objective (e.g., "10x/0.30"). Returns None if not found.
+        """
+        try:
+            camera_settings_node = search_for_node(
+                self.scene_root, "ATLCameraSettingDefinition"
+            )
+            objective_name = camera_settings_node.get("ObjectiveName")
+            if objective_name is None:
+                raise ValueError("ObjectiveName attribute not found")
+            return objective_name.strip()
+        except Exception as exc:
+            log.warning("Failed to extract objective: %s", exc, exc_info=True)
+        return None
+
+    @property
+    def total_time_duration(self) -> Optional[int]:
+        """
+        Extracts the total time duration of the acquisition (in seconds).
+
+        Returns
+        -------
+        Optional[int]
+            Total duration in seconds.
+            Returns None if timestamps are missing or invalid.
+        """
+        try:
+            timestamp_list_node = search_for_node(self.scene_root, "TimeStampList")
+            if timestamp_list_node is None:
+                raise ValueError("TimeStampList node not found in scene_root.")
+            if timestamp_list_node.text is None:
+                raise ValueError("TimeStampList node text is missing.")
+
+            timestamps_str = timestamp_list_node.text.strip()
+            if not timestamps_str:
+                raise ValueError("TimeStampList node text is empty.")
+            timestamps = timestamps_str.split(" ")
+
+            total_duration_delta = self._convert_lif_timestamp(
+                timestamps[-1]
+            ) - self._convert_lif_timestamp(timestamps[0])
+            return int(total_duration_delta.total_seconds())
+        except Exception as exc:
+            log.warning("Failed to extract total time duration: %s", exc, exc_info=True)
+            return None
+
+    @property
+    def timelapse_interval(self) -> types.TimeInterval:
+        """
+        Time between consecutive timepoints:
+        """
+        if self.total_time_duration is None or self.dims.T < 2:
+            return None
+        return self.total_time_duration / (self.dims.T - 1)
+
+    @property
+    def imaging_date(self) -> Optional[datetime.datetime]:
+        """
+        Extracts the acquisition start date as a UTC datetime.
+
+        Returns
+        -------
+        Optional[datetime.datetime]
+            Acquisition start time. Returns None if unavailable or malformed.
+        """
+        try:
+            timestamp_list_node = search_for_node(self.metadata, "TimeStampList")
+            if timestamp_list_node is None:
+                raise ValueError("TimeStampList node not found in metadata.")
+            if timestamp_list_node.text is None:
+                raise ValueError("TimeStampList node text is missing in metadata.")
+
+            timestamps_str = timestamp_list_node.text.strip()
+            if not timestamps_str:
+                raise ValueError("TimeStampList node text is empty in metadata.")
+            timestamps = timestamps_str.split(" ")
+
+            return self._convert_lif_timestamp(timestamps[0])
+        except Exception as exc:
+            log.warning("Failed to extract imaging date: %s", exc, exc_info=True)
+            return None
+
+    @property
+    def standard_metadata(self) -> StandardMetadata:
+        """
+        Return the standard metadata for this reader, updating specific fields.
+
+        This implementation calls the base reader’s standard_metadata property
+        via super() and then assigns the new values.
+        """
+        metadata = super().standard_metadata
+        metadata.binning = self.binning
+        metadata.column = self.column
+        metadata.row = self.row
+        metadata.objective = self.objective
+        metadata.imaging_date = self.imaging_date
+        metadata.total_time_duration = self.total_time_duration
+        metadata.timelapse_interval = self.timelapse_interval
+        metadata.position_index = self.current_scene_index
+
+        return metadata
