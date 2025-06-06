@@ -1086,6 +1086,15 @@ class Reader(reader.Reader):
             return None
 
     @property
+    def timelapse_interval(self) -> Optional[float]:
+        """
+        Time between consecutive timepoints:
+        """
+        if self.total_time_duration is None or self.dims.T < 2:
+            return None
+        return self.total_time_duration / (self.dims.T - 1)
+
+    @property
     def imaging_date(self) -> Optional[datetime.datetime]:
         """
         Extracts the acquisition start date as a UTC datetime.
@@ -1127,6 +1136,7 @@ class Reader(reader.Reader):
         metadata.objective = self.objective
         metadata.imaging_date = self.imaging_date
         metadata.total_time_duration = self.total_time_duration
+        metadata.timelapse_interval = self.timelapse_interval
         metadata.position_index = self.current_scene_index
 
         return metadata
