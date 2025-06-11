@@ -89,8 +89,12 @@ class Reader(reader.Reader):
                 LifFile(open_resource)
                 return True
 
-        except ValueError:
-            return False
+        except Exception as e:
+            raise exceptions.UnsupportedFileFormatError(
+                "bioio-lif",
+                path,
+                "file is not supported: " + str(e),
+            )
 
     def __init__(
         self,
@@ -134,10 +138,7 @@ class Reader(reader.Reader):
         self._scene_short_info: Dict[str, Any] = {}
 
         # Enforce valid image
-        if not self._is_supported_image(self._fs, self._path):
-            raise exceptions.UnsupportedFileFormatError(
-                self.__class__.__name__, self._path
-            )
+        self._is_supported_image(self._fs, self._path)
 
     @property
     def scenes(self) -> Tuple[str, ...]:
