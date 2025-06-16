@@ -1095,7 +1095,7 @@ class Reader(reader.Reader):
         return self.total_time_duration / (self.dims.T - 1)
 
     @property
-    def imaging_date(self) -> Optional[datetime.datetime]:
+    def imaging_datetime(self) -> Optional[datetime.datetime]:
         """
         Extracts the acquisition start date as a UTC datetime.
 
@@ -1134,7 +1134,7 @@ class Reader(reader.Reader):
         metadata.column = self.column
         metadata.row = self.row
         metadata.objective = self.objective
-        metadata.imaging_date = self.imaging_date
+        metadata.imaging_datetime = self.imaging_datetime
         metadata.total_time_duration = self.total_time_duration
         metadata.timelapse_interval = self.timelapse_interval
         metadata.position_index = self.current_scene_index
