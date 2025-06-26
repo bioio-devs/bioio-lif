@@ -1056,40 +1056,75 @@ class Reader(reader.Reader):
         return None
 
     @property
-    def total_time_duration(self) -> Optional[int]:
+    def total_time_duration(self) -> Optional[datetime.timedelta]:
         """
-        Extracts the total time duration of the acquisition (in seconds).
+        Extracts the total time duration of the acquisition as a timedelta object.
+        This is the interval from the start of the first timepoint to the
+        start of the last timepoint.
 
         Returns
         -------
-        Optional[int]
-            Total duration in seconds.
+        Optional[timedelta]
+            Total duration as a timedelta object.
             Returns None if timestamps are missing or invalid.
         """
         try:
+            # Parse timestamps
             timestamp_list_node = search_for_node(self.scene_root, "TimeStampList")
-            if timestamp_list_node is None:
-                raise ValueError("TimeStampList node not found in scene_root.")
-            if timestamp_list_node.text is None:
-                raise ValueError("TimeStampList node text is missing.")
+            if timestamp_list_node is None or timestamp_list_node.text is None:
+                raise ValueError("TimeStampList node not found or contains no text.")
 
             timestamps_str = timestamp_list_node.text.strip()
             if not timestamps_str:
                 raise ValueError("TimeStampList node text is empty.")
-            timestamps = timestamps_str.split(" ")
 
-            total_duration_delta = self._convert_lif_timestamp(
-                timestamps[-1]
-            ) - self._convert_lif_timestamp(timestamps[0])
-            return int(total_duration_delta.total_seconds())
+            timestamps = timestamps_str.split(" ")
+            if len(timestamps) < 2:
+                raise ValueError("Not enough timestamps to compute duration.")
+
+            # Extract dimensions with defaults
+            m = getattr(self.dims, "M", 1)
+            c = getattr(self.dims, "C", 1)
+            z = getattr(self.dims, "Z", 1)
+            t = getattr(self.dims, "T", 1)
+
+            images_per_timepoint = m * c * z
+            expected_total_timestamps = images_per_timepoint * t
+
+            if images_per_timepoint == 0:
+                raise ValueError("Invalid dimension sizes (zero images per timepoint).")
+
+            if len(timestamps) != expected_total_timestamps:
+                raise ValueError(
+                    f"Timestamp count {len(timestamps)} does not match "
+                    f"expected {expected_total_timestamps} based on "
+                    f"dims M={m}, C={c}, Z={z}, T={t}."
+                )
+
+            # Compute start of first and last timepoints
+            start_of_first = self._convert_lif_timestamp(timestamps[0])
+            start_of_last = self._convert_lif_timestamp(
+                timestamps[-images_per_timepoint]
+            )
+
+            total_duration = start_of_last - start_of_first
+
+            return total_duration
+
         except Exception as exc:
             log.warning("Failed to extract total time duration: %s", exc, exc_info=True)
             return None
 
     @property
-    def timelapse_interval(self) -> types.TimeInterval:
+    def timelapse_interval(self) -> Optional[datetime.timedelta]:
         """
-        Time between consecutive timepoints:
+        Average time between consecutive timepoints as a timedelta object.
+
+        Returns
+        -------
+        Optional[timedelta]
+            Average interval between timepoints.
+            Returns None if total_time_duration is None or less than two timepoints.
         """
         if self.total_time_duration is None or self.dims.T < 2:
             return None
