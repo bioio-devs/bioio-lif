@@ -1,0 +1,2 @@
+bioio/tests/resources/** filter=lfs diff=lfs merge=lfs -text
+bioio_lif/tests/resources/** filter=lfs diff=lfs merge=lfs -text
