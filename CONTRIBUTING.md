@@ -15,10 +15,16 @@ This project uses Git Large File Storage (LFS) to store large test resources und
 Before cloning, make sure you have Git LFS installed:
 
 ### macOS
-`brew install git-lfs`
+```
+brew install git-lfs
+git lfs install
+```
 
 ### Debian/Ubuntu
-`sudo apt-get install git-lfs`
+```
+sudo apt-get install git-lfs
+git lfs install
+```
 
 ### Or install manually: https://git-lfs.github.com/
 
