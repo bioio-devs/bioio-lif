@@ -33,7 +33,8 @@ dependencies = [
   "fsspec>=2022.8.0",
   "numpy>=1.16",
   "PyYAML>=6.0",
-  "xarray>=0.16.1", "readlif @ https://github.com/Arcadia-Science/readlif.git",
+  "readlif>=0.6.6",
+  "xarray>=0.16.1",
 ]
 
 [project.urls]
@@ -117,7 +118,7 @@ per-file-ignores = [
 ]
 [tool.pixi.project]
 channels = ["conda-forge"]
-platforms = ["win-64"]
+platforms = ["win-64", "osx-arm64"]
 
 [tool.pixi.pypi-dependencies]
 bioio-lif = { path = ".", editable = true }
