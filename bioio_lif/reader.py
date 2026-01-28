@@ -1173,6 +1173,5 @@ class Reader(reader.Reader):
         metadata.imaging_datetime = self.imaging_datetime
         metadata.total_time_duration = self.total_time_duration
         metadata.timelapse_interval = self.timelapse_interval
-        metadata.position_index = self.current_scene_index
 
         return metadata
