@@ -33,7 +33,7 @@ dependencies = [
   "fsspec>=2022.8.0",
   "numpy>=1.16",
   "PyYAML>=6.0",
-  "readlif>=0.6.4",
+  "readlif>=0.6.6",
   "xarray>=0.16.1",
 ]
 
