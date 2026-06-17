@@ -289,3 +289,68 @@ def test_lif_reader_mosaic_tile_inspection(
 
     # Assert equal
     np.testing.assert_array_equal(tile_from_m_index, tile_from_position)
+
+
+@pytest.mark.parametrize(
+    "channel_xml, expected_channel_names",
+    [
+        # Every channel has a matching detail
+        (
+            """
+            <root><Image>
+            <ChannelDescription LUTName="Gray"/>
+            <ChannelDescription LUTName="Green"/>
+            <WideFieldChannelInfo LUT="Gray"
+                ContrastingMethodName="TL-BF" FluoCubeName="EMP_BF"/>
+            <WideFieldChannelInfo LUT="Green"
+                ContrastingMethodName="FLUO" FluoCubeName="GFP"/>
+            </Image></root>
+            """,
+            ["Gray--TL-BF--EMP_BF", "Green--FLUO--GFP"],
+        ),
+        # Fewer details than channels: unmatched channels fall back to their own
+        # LUTName instead of forcing every channel onto the fallback (issue #49)
+        (
+            """
+            <root><Image>
+            <ChannelDescription LUTName="Gray"/>
+            <ChannelDescription LUTName="Green"/>
+            <ChannelDescription LUTName="Red"/>
+            <ChannelDescription LUTName="Blue"/>
+            <WideFieldChannelInfo LUT="Gray"
+                ContrastingMethodName="TL-BF" FluoCubeName="EMP_BF"/>
+            <WideFieldChannelInfo LUT="Green"
+                ContrastingMethodName="FLUO" FluoCubeName="GFP"/>
+            <WideFieldChannelInfo LUT="Red"
+                ContrastingMethodName="FLUO" FluoCubeName="RFP"/>
+            </Image></root>
+            """,
+            ["Gray--TL-BF--EMP_BF", "Green--FLUO--GFP", "Red--FLUO--RFP", "Blue"],
+        ),
+        # No details at all: every channel uses its LUTName
+        (
+            """
+            <root><Image>
+            <ChannelDescription LUTName="Gray"/>
+            <ChannelDescription LUTName="Red"/>
+            </Image></root>
+            """,
+            ["Gray", "Red"],
+        ),
+    ],
+)
+def test_channel_name_matching(
+    channel_xml: str,
+    expected_channel_names: List[str],
+) -> None:
+    xml = ET.fromstring(channel_xml)
+    image_short_info = {
+        "scale": (1.0, 1.0, 1.0, 1.0),
+        "dims": type("Dims", (), {"x": 2, "y": 2, "z": 1, "t": 1})(),
+    }
+
+    coords, _ = Reader._get_coords_and_physical_px_sizes(
+        xml, image_short_info, scene_index=0
+    )
+
+    assert list(coords[dimensions.DimensionNames.Channel]) == expected_channel_names
