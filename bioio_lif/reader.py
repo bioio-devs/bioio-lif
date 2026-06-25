@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 from copy import copy
 from dataclasses import dataclass
 from math import floor
-from typing import Any, Dict, Hashable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Tuple, Union
 
 import dask.array as da
 import numpy as np
@@ -18,7 +18,11 @@ from dask import delayed
 from fsspec.spec import AbstractFileSystem
 from readlif.reader import LifFile
 
+from . import lif_metadata
 from .io import search_for_node
+
+if TYPE_CHECKING:
+    from ome_types.model import OME
 
 ###############################################################################
 
@@ -438,7 +442,13 @@ class Reader(reader.Reader):
                     )
                 )
             else:
-                scene_channel_list.append(f"{channel.attrib['LUTName']}")
+                # Confocal (no WideFieldChannelInfo): the bare ``LUTName`` is just
+                # a display color ("Blue", "Gray", ...). Prefer the real
+                # fluorophore from the channel's ``ChannelProperty`` ``DyeName``
+                # when present, falling back to ``LUTName`` so behavior is
+                # unchanged for channels that record no dye.
+                dye_name = lif_metadata.channel_dye_name(channel)
+                scene_channel_list.append(dye_name or f"{channel.attrib['LUTName']}")
 
         # Attach channel names to coords
         coords[dimensions.DimensionNames.Channel] = scene_channel_list
@@ -1175,3 +1185,86 @@ class Reader(reader.Reader):
         metadata.timelapse_interval = self.timelapse_interval
 
         return metadata
+
+    @staticmethod
+    def _ome_pixel_type(dtype: np.dtype) -> str:
+        """Map a numpy dtype to an OME ``PixelType`` string.
+
+        OME's pixel-type names line up with numpy's for the integer types LIF
+        uses (``uint8`` / ``uint16`` / ...); ``float32`` / ``float64`` map to
+        OME's ``float`` / ``double``.
+        """
+        name = np.dtype(dtype).name
+        special = {"float32": "float", "float64": "double"}
+        return special.get(name, name)
+
+    @property
+    def ome_metadata(self) -> "OME":
+        """
+        Returns
+        -------
+        metadata: OME
+            The current scene's metadata transformed into the OME specification.
+            This is not a complete transformation, but it is a valid one: it
+            carries the scene's pixel geometry and -- the reason this exists --
+            per-channel identity (name/fluor + excitation/emission wavelengths)
+            recovered from the Leica confocal acquisition settings.
+
+        Notes
+        -----
+        Channel identity is extracted from the genuine sequential settings
+        (``LDM_Block_Sequential_List``) rather than the bare display ``LUTName``;
+        see :mod:`bioio_lif.lif_metadata`.
+        """
+        from ome_types.model import OME, Image, Pixels
+
+        # Ensure dims / pixel sizes are populated for the current scene.
+        dims = self.dims
+        dim_to_size = dict(zip(dims.order, self.shape))
+
+        # The OME dimension order is the reverse of bioio's data order, with the
+        # mosaic-tile axis (not an OME dimension) removed. bioio data is laid out
+        # [M][T][C][Z]YX, so dropping M and reversing yields one of the canonical
+        # OME XY-leading orders (e.g. TCZYX -> XYZCT).
+        ome_axes = [d for d in dims.order if d != dimensions.DimensionNames.MosaicTile]
+        dimension_order = "".join(reversed(ome_axes))
+
+        # Per-channel identity from the current scene's XML node.
+        img_sets = self.metadata.findall(".//Image")
+        scene_root = img_sets[self.current_scene_index]
+        channel_identities = lif_metadata.extract_channels(scene_root)
+        ome_channels = lif_metadata.channels_to_ome_channels(channel_identities)
+
+        # Physical pixel sizes (microns); attach only when known.
+        px = self.physical_pixel_sizes
+        pixel_kwargs: Dict[str, Any] = {}
+        if px.X is not None:
+            pixel_kwargs["physical_size_x"] = px.X
+            pixel_kwargs["physical_size_x_unit"] = "µm"
+        if px.Y is not None:
+            pixel_kwargs["physical_size_y"] = px.Y
+            pixel_kwargs["physical_size_y_unit"] = "µm"
+        if px.Z is not None:
+            pixel_kwargs["physical_size_z"] = px.Z
+            pixel_kwargs["physical_size_z_unit"] = "µm"
+
+        pixels = Pixels(
+            id="Pixels:0",
+            dimension_order=dimension_order,
+            type=self._ome_pixel_type(self.dtype),
+            size_x=dim_to_size.get(dimensions.DimensionNames.SpatialX, 1),
+            size_y=dim_to_size.get(dimensions.DimensionNames.SpatialY, 1),
+            size_z=dim_to_size.get(dimensions.DimensionNames.SpatialZ, 1),
+            size_c=dim_to_size.get(dimensions.DimensionNames.Channel, 1),
+            size_t=dim_to_size.get(dimensions.DimensionNames.Time, 1),
+            channels=ome_channels,
+            **pixel_kwargs,
+        )
+
+        image = Image(
+            id="Image:0",
+            name=self.current_scene,
+            pixels=pixels,
+        )
+
+        return OME(images=[image])
