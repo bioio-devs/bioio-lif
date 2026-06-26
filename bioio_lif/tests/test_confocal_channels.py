@@ -10,10 +10,11 @@ without the (git-LFS) sample ``.lif`` binaries that the rest of the suite needs.
 
 import pathlib
 import xml.etree.ElementTree as ET
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 import pytest
+from bioio_base import dimensions, types
 
 from bioio_lif import lif_metadata
 from bioio_lif.reader import Reader
@@ -119,36 +120,45 @@ def test_channels_to_ome_channels_omits_unknown_fields() -> None:
     assert ome_ch.emission_wavelength is None
 
 
-class _FakeDims:
-    """Minimal stand-in for bioio_base.dimensions.Dimensions."""
+class _StubReader(Reader):
+    """A ``Reader`` stand-in that drives ``ome_metadata`` from the confocal
+    fixture.
 
-    def __init__(self, order: str) -> None:
-        self.order = order
-
-
-class _StubReader:
-    """A Reader with just enough state to drive ``ome_metadata``.
-
-    Lets us exercise the property without the git-LFS sample ``.lif`` binaries:
-    we feed it the confocal scene XML and a known geometry, then assert the
-    resulting OME. The bound ``Reader.ome_metadata`` getter is reused verbatim.
+    It overrides only the properties the getter reads, with correctly typed
+    values, so the real ``ome_metadata`` runs without the git-LFS sample
+    ``.lif`` binaries.
     """
 
-    ome_metadata = Reader.ome_metadata
-    _ome_pixel_type = staticmethod(Reader._ome_pixel_type)
-
     def __init__(self, scene_root: ET.Element) -> None:
-        # Wrap the scene element so ``.//Image`` resolves like the real metadata.
-        self.metadata = scene_root
-        self.current_scene = "confocal-scene"
-        self.current_scene_index = 0
-        self.dims = _FakeDims("TCZYX")
-        self.shape = (1, 7, 1, 64, 64)
-        self.dtype = np.dtype(np.uint16)
+        self._scene_root = scene_root
 
-        from bioio_base import types
+    @property
+    def metadata(self) -> ET.Element:
+        return self._scene_root
 
-        self.physical_pixel_sizes = types.PhysicalPixelSizes(0.5, 0.1, 0.1)
+    @property
+    def dims(self) -> dimensions.Dimensions:
+        return dimensions.Dimensions("TCZYX", self.shape)
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        return (1, 7, 1, 64, 64)
+
+    @property
+    def dtype(self) -> np.dtype:
+        return np.dtype(np.uint16)
+
+    @property
+    def current_scene(self) -> str:
+        return "confocal-scene"
+
+    @property
+    def current_scene_index(self) -> int:
+        return 0
+
+    @property
+    def physical_pixel_sizes(self) -> types.PhysicalPixelSizes:
+        return types.PhysicalPixelSizes(0.5, 0.1, 0.1)
 
 
 def test_ome_metadata_builds_valid_ome() -> None:

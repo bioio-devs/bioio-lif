@@ -212,12 +212,13 @@ def channel_dye_name(channel_desc: ET.Element) -> Optional[str]:
     return _strip_dye_prefix(props.get("DyeName") or None)
 
 
-def extract_channels(scene_root: ET.Element) -> List[ChannelIdentity]:
+def extract_channels(scene_root: Optional[ET.Element]) -> List[ChannelIdentity]:
     """Extract per-channel identity from one Leica LIF scene XML element.
 
     ``scene_root`` is any element that contains the scene's ``ChannelDescription``
     elements and ``LDM_Block_Sequential`` settings as descendants (e.g. the
-    ``<Image>`` node, or the enclosing scene ``<Element>``).
+    ``<Image>`` node, or the enclosing scene ``<Element>``); ``None`` yields
+    ``[]``.
 
     Returns one dict per image channel, in acquisition (document) order, each
     with exactly the keys ``index``, ``dye``, ``fluor``, ``detector``,
