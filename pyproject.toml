@@ -32,6 +32,7 @@ dependencies = [
   "dask[array]>=2021.4.1",
   "fsspec>=2022.8.0",
   "numpy>=1.16",
+  "ome-types>=0.3.4",
   "PyYAML>=6.0",
   "readlif>=0.6.6",
   "xarray>=0.16.1",
