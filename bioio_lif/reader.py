@@ -424,21 +424,26 @@ class Reader(reader.Reader):
         img = img_sets[scene_index]
 
         # Construct channel list
-        scene_channel_list = []
         channels = img.findall(".//ChannelDescription")
         channel_details = img.findall(".//WideFieldChannelInfo")
-        for i, channel in enumerate(channels):
-            if len(channels) <= len(channel_details):
-                channel_detail = channel_details[i]
-                scene_channel_list.append(
-                    (
-                        f"{channel_detail.attrib['LUT']}"
-                        f"--{channel_detail.attrib['ContrastingMethodName']}"
-                        f"--{channel_detail.attrib['FluoCubeName']}"
-                    )
+
+        detail_by_lut: Dict[str, ET.Element] = {}
+        for detail in channel_details:
+            detail_by_lut.setdefault(detail.attrib.get("LUT", ""), detail)
+
+        scene_channel_list = []
+        for channel in channels:
+            matched_detail = detail_by_lut.get(channel.attrib.get("LUTName", ""))
+            # A channel only has a composite name when a detail matched its LUT;
+            # otherwise fall back to the channel's own LUTName (issue #49).
+            if matched_detail is not None:
+                name = "--".join(
+                    matched_detail.attrib.get(key, "")
+                    for key in ("LUT", "ContrastingMethodName", "FluoCubeName")
                 )
             else:
-                scene_channel_list.append(f"{channel.attrib['LUTName']}")
+                name = channel.attrib.get("LUTName", "")
+            scene_channel_list.append(name)
 
         # Attach channel names to coords
         coords[dimensions.DimensionNames.Channel] = scene_channel_list
