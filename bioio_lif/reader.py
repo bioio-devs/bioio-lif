@@ -434,6 +434,8 @@ class Reader(reader.Reader):
         scene_channel_list = []
         for channel in channels:
             matched_detail = detail_by_lut.get(channel.attrib.get("LUTName", ""))
+            # A channel only has a composite name when a detail matched its LUT;
+            # otherwise fall back to the channel's own LUTName (issue #49).
             if matched_detail is not None:
                 name = "--".join(
                     matched_detail.attrib.get(key, "")
