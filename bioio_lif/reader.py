@@ -372,20 +372,14 @@ class Reader(reader.Reader):
 
         return coords, px_sizes
 
-    def _read(self, delayed: bool) -> xr.DataArray:
+    def _read_delayed(self) -> xr.DataArray:
         """
-        Construct the xarray DataArray object for the image.
-
-        Parameters
-        ----------
-        delayed: bool
-            If True, the image data is a fully delayed dask array. Otherwise the
-            image data is read fully into memory.
+        Construct the delayed xarray DataArray object for the image.
 
         Returns
         -------
         image: xr.DataArray
-            The fully constructed image as a DataArray object.
+            The fully constructed and fully delayed image as a DataArray object.
             Metadata is attached in some cases as coords, dims, and attrs.
 
         Raises
@@ -410,16 +404,7 @@ class Reader(reader.Reader):
                     dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST
 
                 # Get image data
-                if delayed:
-                    image_data = self._create_dask_array(image, dims)
-                else:
-                    image_data = self._get_image_data(
-                        fs=self._fs,
-                        path=self._path,
-                        scene=self.current_scene_index,
-                        retrieve_dims=dims,
-                        retrieve_indices=[None] * len(dims),  # Get all planes
-                    )
+                image_data = self._create_dask_array(image, dims)
 
                 # Create coordinate planes
                 coords, px_sizes = self._get_coords_and_physical_px_sizes(
@@ -437,11 +422,61 @@ class Reader(reader.Reader):
                     attrs={constants.METADATA_UNPROCESSED: lif.xml_element},
                 )
 
-    def _read_delayed(self) -> xr.DataArray:
-        return self._read(delayed=True)
-
     def _read_immediate(self) -> xr.DataArray:
-        return self._read(delayed=False)
+        """
+        Construct the in-memory xarray DataArray object for the image.
+
+        Returns
+        -------
+        image: xr.DataArray
+            The fully constructed and fully read into memory image as a DataArray
+            object. Metadata is attached in some cases as coords, dims, and attrs.
+
+        Raises
+        ------
+        exceptions.UnsupportedFileFormatError
+            The file could not be read or is not supported.
+        """
+        with self._fs.open(self._path) as open_resource:
+            with LifFile(open_resource) as lif:
+                image = lif.images[self.current_scene_index]
+                self._tilescan = image.tilescan
+
+                # If there are tiles in the image use mosaic dims
+                if (
+                    self._tilescan is not None
+                    or dimensions.DimensionNames.MosaicTile in image.sizes
+                ):
+                    dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST_WITH_MOSAIC_TILES
+
+                # Otherwise use standard dims
+                else:
+                    dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST
+
+                # Get image data
+                image_data = self._get_image_data(
+                    fs=self._fs,
+                    path=self._path,
+                    scene=self.current_scene_index,
+                    retrieve_dims=dims,
+                    retrieve_indices=[None] * len(dims),  # Get all planes
+                )
+
+                # Create coordinate planes
+                coords, px_sizes = self._get_coords_and_physical_px_sizes(
+                    image_xml=image.xml_element.find("Data/Image"),
+                    sizes={dim: image.sizes.get(dim, 1) for dim in dims},
+                )
+
+                # Store pixel sizes
+                self._physical_pixel_sizes = px_sizes
+
+                return xr.DataArray(
+                    image_data,
+                    dims=dims,
+                    coords=coords,
+                    attrs={constants.METADATA_UNPROCESSED: lif.xml_element},
+                )
 
     @property
     def _tiles(self) -> np.ndarray:
