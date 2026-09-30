@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 import xml.etree.ElementTree as ET
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pytest
 from bioio_base import dimensions, exceptions, test_utilities
-from readlif.reader import LifFile
+from liffile import LifFile
 
 from bioio_lif import Reader
 
@@ -32,7 +32,7 @@ from .conftest import LOCAL_RESOURCES_DIR
             np.uint16,
             dimensions.DEFAULT_DIMENSION_ORDER,
             ["Gray--TL-BF--EMP_BF", "Green--FLUO--GFP"],
-            (None, 0.32499999999999996, 0.32499999999999996),
+            (None, 0.325, 0.325),
         ),
         (
             "s_1_t_4_c_2_z_1.lif",
@@ -52,7 +52,7 @@ from .conftest import LOCAL_RESOURCES_DIR
             np.uint8,
             dimensions.DEFAULT_DIMENSION_ORDER_WITH_MOSAIC_TILES,
             ["Gray", "Red", "Green", "Cyan"],
-            (None, 0.20061311154598827, 0.20061311154598827),
+            (None, 0.2006131115459883, 0.2006131115459883),
         ),
         pytest.param(
             "example.txt",
@@ -122,27 +122,27 @@ def test_sanity_check_correct_indexing(
 
     # Construct reader
     reader = Reader(uri, chunk_dims=chunk_dims, is_x_and_y_swapped=True)
-    lif_img = LifFile(uri).get_image(0)
 
     # Pull a chunk from LifReader
     chunk_from_lif_reader = reader.get_image_dask_data(get_dims).compute()
 
-    # Pull what should be the same chunk from LifImage
-    planes = []
-    reshape_values = []
-    for dim in get_dims:
-        dim_size = getattr(lif_img.info["dims"], dim.lower())
-        reshape_values.append(dim_size)
+    # Pull what should be the same chunk directly from liffile:
+    # every plane along the requested non-YX dimension, all other dimensions at 0
+    with LifFile(uri) as lif:
+        lif_img = lif.images[0]
+        selection: Dict[str, Optional[int]] = {
+            dim: 0 for dim in lif_img.dims if dim not in ["Y", "X"]
+        }
+        if get_dims[0] in selection:
+            selection[get_dims[0]] = None
+        chunk_from_liffile = lif_img.frames(**selection).asarray()
 
-        if dim not in ["Y", "X"]:
-            for i in range(dim_size):
-                planes.append(np.asarray(lif_img.get_frame(**{dim.lower(): i})))
-
-    # Stack and reshape
-    chunk_from_read_lif = np.stack(planes).reshape(tuple(reshape_values))
+    # liffile drops length-1 dimensions, add it back for comparison
+    if get_dims[0] not in lif_img.dims:
+        chunk_from_liffile = chunk_from_liffile[np.newaxis]
 
     # Compare
-    np.testing.assert_array_equal(chunk_from_lif_reader, chunk_from_read_lif)
+    np.testing.assert_array_equal(chunk_from_lif_reader, chunk_from_liffile)
 
 
 @pytest.mark.parametrize(
@@ -344,13 +344,8 @@ def test_channel_name_matching(
     expected_channel_names: List[str],
 ) -> None:
     xml = ET.fromstring(channel_xml)
-    image_short_info = {
-        "scale": (1.0, 1.0, 1.0, 1.0),
-        "dims": type("Dims", (), {"x": 2, "y": 2, "z": 1, "t": 1})(),
-    }
+    sizes = {"T": 1, "C": 2, "Z": 1, "Y": 2, "X": 2}
 
-    coords, _ = Reader._get_coords_and_physical_px_sizes(
-        xml, image_short_info, scene_index=0
-    )
+    coords, _ = Reader._get_coords_and_physical_px_sizes(xml, sizes)
 
     assert list(coords[dimensions.DimensionNames.Channel]) == expected_channel_names
