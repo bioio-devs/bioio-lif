@@ -126,8 +126,6 @@ def test_sanity_check_correct_indexing(
     # Pull a chunk from LifReader
     chunk_from_lif_reader = reader.get_image_dask_data(get_dims).compute()
 
-    # Pull what should be the same chunk directly from liffile:
-    # every plane along the requested non-YX dimension, all other dimensions at 0
     with LifFile(uri) as lif:
         lif_img = lif.images[0]
         selection: Dict[str, Optional[int]] = {
