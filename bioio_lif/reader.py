@@ -392,11 +392,9 @@ class Reader(reader.Reader):
                 image = lif.images[self.current_scene_index]
                 self._tilescan = image.tilescan
 
-                # If there are tiles in the image use mosaic dims
-                if (
-                    self._tilescan is not None
-                    or dimensions.DimensionNames.MosaicTile in image.sizes
-                ):
+                # If there are tiles in the image use mosaic dims. liffile drops
+                # length-1 dimensions, so a single-tile scan is not a mosaic here
+                if dimensions.DimensionNames.MosaicTile in image.sizes:
                     dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST_WITH_MOSAIC_TILES
 
                 # Otherwise use standard dims
@@ -442,11 +440,9 @@ class Reader(reader.Reader):
                 image = lif.images[self.current_scene_index]
                 self._tilescan = image.tilescan
 
-                # If there are tiles in the image use mosaic dims
-                if (
-                    self._tilescan is not None
-                    or dimensions.DimensionNames.MosaicTile in image.sizes
-                ):
+                # If there are tiles in the image use mosaic dims. liffile drops
+                # length-1 dimensions, so a single-tile scan is not a mosaic here
+                if dimensions.DimensionNames.MosaicTile in image.sizes:
                     dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST_WITH_MOSAIC_TILES
 
                 # Otherwise use standard dims

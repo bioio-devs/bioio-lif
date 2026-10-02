@@ -54,6 +54,21 @@ from .conftest import LOCAL_RESOURCES_DIR
             ["Gray", "Red", "Green", "Cyan"],
             (None, 0.2006131115459883, 0.2006131115459883),
         ),
+        # A tile scan with a single tile is not a mosaic
+        (
+            "single_tile_scan.lif",
+            "sg30 control 48 hr after transfection 10x",
+            (
+                "sg30 control 48 hr after transfection",
+                "sg30 control 48 hr after transfection 10x",
+                "sg30 control 48 hr after transfection_higher exposure",
+            ),
+            (1, 3, 1, 1024, 1024),
+            np.uint16,
+            dimensions.DEFAULT_DIMENSION_ORDER,
+            ["Gray--TL-BF--EMP_BF", "Red--FLUO--TXR", "Green"],
+            (None, 1.3182248289345062, 1.3182248289345062),
+        ),
         pytest.param(
             "example.txt",
             None,
