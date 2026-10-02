@@ -27,9 +27,10 @@ def make_mock_reader(
         mock_fs_patch.return_value = (mock_fs, "dummy_path.lif")
 
         mock_lif = MagicMock()
-        mock_lif.image_list = [{"name": "Scene_1"}]
-        mock_lif.xml_root = None
+        mock_lif.images = [MagicMock(path="Scene_1")]
+        mock_lif.xml_element = None
         mock_lif_patch.return_value = mock_lif
+        mock_lif.__enter__.return_value = mock_lif
 
         reader = Reader(image="dummy_path.lif")
         reader._metadata = metadata
