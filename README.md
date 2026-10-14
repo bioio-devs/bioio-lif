@@ -2,7 +2,7 @@
 
 [![Build Status](https://github.com/bioio-devs/bioio-lif/actions/workflows/ci.yml/badge.svg)](https://github.com/bioio-devs/bioio-lif/actions)
 [![PyPI version](https://badge.fury.io/py/bioio-lif.svg)](https://badge.fury.io/py/bioio-lif)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![License: BSD-3](https://img.shields.io/badge/License-BSD--3-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
 [![Python 3.11–3.13](https://img.shields.io/badge/python-3.11--3.13-blue.svg)](https://www.python.org/downloads/)
 
 A BioIO reader plugin for reading LIF (Leica) images using `liffile`
