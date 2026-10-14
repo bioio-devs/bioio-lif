@@ -6,7 +6,6 @@ import logging
 import xml.etree.ElementTree as ET
 from copy import copy
 from dataclasses import dataclass
-from math import floor
 from typing import Any, Dict, Hashable, List, Optional, Tuple, Union
 
 import dask.array as da
@@ -16,13 +15,21 @@ from bioio_base import constants, dimensions, exceptions, io, reader, transforms
 from bioio_base.standard_metadata import StandardMetadata
 from dask import delayed
 from fsspec.spec import AbstractFileSystem
-from readlif.reader import LifFile
+from liffile import LifFile, LifImageABC, LifTileScanInfo
 
 from .io import search_for_node
 
 ###############################################################################
 
 log = logging.getLogger(__name__)
+
+# DimID values used by LIF DimensionDescription elements
+LIF_DIM_ID_TO_NAME = {
+    "1": dimensions.DimensionNames.SpatialX,
+    "2": dimensions.DimensionNames.SpatialY,
+    "3": dimensions.DimensionNames.SpatialZ,
+    "4": dimensions.DimensionNames.Time,
+}
 
 ###############################################################################
 
@@ -35,7 +42,7 @@ class WellPosition:
 
 class Reader(reader.Reader):
     """
-    Wraps the readlif API to provide a bioio reader plugin for
+    Wraps the liffile API to provide a bioio reader plugin for
     volumetric LIF images.
 
     Parameters
@@ -59,13 +66,11 @@ class Reader(reader.Reader):
         flipped along the other axis.
     is_x_and_y_swapped:bool, default = True
         If `is_x_and_y_swapped` is True, the field_x and field_y given
-        from the mosaic_position will be swapped such that field_x represents y
+        from the tile scan info will be swapped such that field_x represents y
         and field_y represents x.
     Notes
     -----
-    To use this reader, install with: `pip install readlif>=0.6.4`.
-
-    readlif is licensed under GPLv3 and is not included in this package.
+    To use this reader, install with: `pip install liffile>=2026.2.16`.
     """
 
     _xarray_dask_data: Optional["xr.DataArray"] = None
@@ -77,6 +82,7 @@ class Reader(reader.Reader):
     _physical_pixel_sizes: Optional[types.PhysicalPixelSizes] = None
     _scenes: Optional[Tuple[str, ...]] = None
     _current_scene_index: int = 0
+    _tilescan: Optional[LifTileScanInfo] = None
     # Do not provide default value because
     # they may not need to be used by your reader (i.e. input param is an array)
     _fs: "AbstractFileSystem"
@@ -86,8 +92,8 @@ class Reader(reader.Reader):
     def _is_supported_image(fs: AbstractFileSystem, path: str, **kwargs: Any) -> bool:
         try:
             with fs.open(path) as open_resource:
-                LifFile(open_resource)
-                return True
+                with LifFile(open_resource):
+                    return True
 
         except Exception as e:
             raise exceptions.UnsupportedFileFormatError(
@@ -124,18 +130,13 @@ class Reader(reader.Reader):
         # will be (1, 3)
         # Ex. where both are true in a 4x4 tiled space, coordinate (1, 0)
         # will be (2, 3)
-        # from the mosaic_position will be swapped such that field_x represents y
-        # and field_y represents x.
         self.is_x_flipped = is_x_flipped
         self.is_y_flipped = is_y_flipped
 
         # If `is_x_and_y_swapped` is True, the field_x and field_y given
-        # from the mosaic_position will be swapped such that field_x represents y
+        # from the tile scan info will be swapped such that field_x represents y
         # and field_y represents x.
         self.is_x_and_y_swapped = is_x_and_y_swapped
-
-        # Delayed storage
-        self._scene_short_info: Dict[str, Any] = {}
 
         # Enforce valid image
         self._is_supported_image(self._fs, self._path)
@@ -144,8 +145,8 @@ class Reader(reader.Reader):
     def scenes(self) -> Tuple[str, ...]:
         if self._scenes is None:
             with self._fs.open(self._path) as open_resource:
-                lif = LifFile(open_resource)
-                self._scenes = tuple(image["name"] for image in lif.image_list)
+                with LifFile(open_resource) as lif:
+                    self._scenes = tuple(image.path for image in lif.images)
         return self._scenes
 
     @staticmethod
@@ -157,8 +158,7 @@ class Reader(reader.Reader):
         retrieve_indices: List[Optional[int]],
     ) -> np.ndarray:
         """
-        Open a file for reading, construct a Zarr store, select data, and compute to
-        numpy.
+        Open a file for reading, select data, and read it into numpy.
 
         Parameters
         ----------
@@ -179,135 +179,52 @@ class Reader(reader.Reader):
         chunk: np.ndarray
             The image chunk as a numpy array.
         """
-        MISSING_DIM_SENTINAL_VALUE = -1
-
-        # Open and select the target image
         with fs.open(path) as open_resource:
-            selected_scene = LifFile(open_resource).get_image(scene)
+            with LifFile(open_resource) as lif:
+                image = lif.images[scene]
 
-            # Create the fill array shape
-            # Drop the YX as we will be pulling the individual YX planes
-            retrieve_shape: List[int] = []
-            use_selected_or_np_map: Dict[str, int] = {}
-            for dim, index_op in zip(retrieve_dims, retrieve_indices):
-                if dim not in [
-                    dimensions.DimensionNames.SpatialY,
-                    dimensions.DimensionNames.SpatialX,
-                ]:
-                    # Handle slices
-                    if index_op is None:
-                        # Store the dim for later to inform to use the np index
-                        use_selected_or_np_map[dim] = MISSING_DIM_SENTINAL_VALUE
-                        if dim == dimensions.DimensionNames.MosaicTile:
-                            retrieve_shape.append(selected_scene.n_mosaic)
-                        elif dim == dimensions.DimensionNames.Time:
-                            retrieve_shape.append(selected_scene.nt)
-                        elif dim == dimensions.DimensionNames.Channel:
-                            retrieve_shape.append(selected_scene.channels)
-                        elif dim == dimensions.DimensionNames.SpatialZ:
-                            retrieve_shape.append(selected_scene.nz)
-
-                    # Handle non-chunk dimensions (specific indices / ints)
-                    else:
-                        # Store the dim for later to inform to use the provided index
-                        use_selected_or_np_map[dim] = index_op
-                        retrieve_shape.append(1)
-
-            # Create list of planes that we will add each plane to, later we reshape
-            # Create empty arr with the desired shape to enumerate over the np index
-            planes: List[np.ndarray] = []
-            np_array_for_indices = np.empty(tuple(retrieve_shape), dtype=object)
-            for np_index, _ in np.ndenumerate(np_array_for_indices):
-                # Get each plane's index selection operations
-                # If the dimension is None, use the enumerated np index
-                # If the dimension is not None, use the provided value
-                plane_indices: Dict[str, int] = {}
-
-                # Handle MosaicTile
-                if dimensions.DimensionNames.MosaicTile in use_selected_or_np_map:
-                    if (
-                        use_selected_or_np_map[dimensions.DimensionNames.MosaicTile]
-                        == MISSING_DIM_SENTINAL_VALUE
-                    ):
-                        plane_indices["m"] = np_index[
-                            retrieve_dims.index(dimensions.DimensionNames.MosaicTile)
-                        ]
-                    else:
-                        plane_indices["m"] = use_selected_or_np_map[
-                            dimensions.DimensionNames.MosaicTile
-                        ]
-
-                # Handle Time
-                if (
-                    use_selected_or_np_map[dimensions.DimensionNames.Time]
-                    == MISSING_DIM_SENTINAL_VALUE
-                ):
-                    plane_indices["t"] = np_index[
-                        retrieve_dims.index(dimensions.DimensionNames.Time)
+                # liffile drops length-1 dimensions from the image, so only
+                # dimensions the image still has can be selected
+                selection = {
+                    dim: index
+                    for dim, index in zip(retrieve_dims, retrieve_indices)
+                    if dim in image.sizes
+                    and dim
+                    not in [
+                        dimensions.DimensionNames.SpatialY,
+                        dimensions.DimensionNames.SpatialX,
                     ]
-                else:
-                    plane_indices["t"] = use_selected_or_np_map[
-                        dimensions.DimensionNames.Time
-                    ]
+                }
+                frames = image.frames(**selection)
+                chunk = frames.asarray()
 
-                # Handle Channels
-                if (
-                    use_selected_or_np_map[dimensions.DimensionNames.Channel]
-                    == MISSING_DIM_SENTINAL_VALUE
-                ):
-                    plane_indices["c"] = np_index[
-                        retrieve_dims.index(dimensions.DimensionNames.Channel)
-                    ]
-                else:
-                    plane_indices["c"] = use_selected_or_np_map[
-                        dimensions.DimensionNames.Channel
-                    ]
+                # Dimensions requested in full are kept, dimensions requested at a
+                # single index are dropped
+                chunk_dims = [
+                    dim
+                    for dim, index in zip(retrieve_dims, retrieve_indices)
+                    if index is None
+                ]
+                frame_dims = list(frames.dims)
+                for dim in chunk_dims:
+                    if dim not in frame_dims:
+                        chunk = chunk[np.newaxis]
+                        frame_dims.insert(0, dim)
 
-                # Handle SpatialZ
-                if (
-                    use_selected_or_np_map[dimensions.DimensionNames.SpatialZ]
-                    == MISSING_DIM_SENTINAL_VALUE
-                ):
-                    plane_indices["z"] = np_index[
-                        retrieve_dims.index(dimensions.DimensionNames.SpatialZ)
-                    ]
-                else:
-                    plane_indices["z"] = use_selected_or_np_map[
-                        dimensions.DimensionNames.SpatialZ
-                    ]
-
-                # Append the retrieved plane as a numpy array
-                planes.append(np.asarray(selected_scene.get_frame(**plane_indices)))
-
-            # Stack and reshape to get rid of the array of arrays
-            scene_dims = selected_scene.info["dims"]
-            retrieved_chunk = np.stack(planes).reshape(
-                np_array_for_indices.shape + (scene_dims.y, scene_dims.x)
-            )
-
-            # Remove extra dimensions if they were not requested
-            remove_dim_ops_list: List[Union[int, slice]] = []
-            for index in retrieve_indices:
-                if isinstance(index, int):
-                    remove_dim_ops_list.append(0)
-                else:
-                    remove_dim_ops_list.append(slice(None, None, None))
-
-            # Remove extra dimensions by using dim ops
-            retrieved_chunk = retrieved_chunk[tuple(remove_dim_ops_list)]
-
-            return retrieved_chunk
+                return np.transpose(
+                    chunk, [frame_dims.index(dim) for dim in chunk_dims]
+                )
 
     def _create_dask_array(
-        self, lif: LifFile, selected_scene_dims: List[str]
+        self, image: LifImageABC, selected_scene_dims: List[str]
     ) -> xr.DataArray:
         """
         Creates a delayed dask array for the file.
 
         Parameters
         ----------
-        lif: LifFile
-            An open LifFile for processing.
+        image: LifImageABC
+            The selected scene from an open LifFile.
         selected_scene_dims: List[str]
             The dimensions for the scene to create the dask array for
 
@@ -325,24 +242,7 @@ class Reader(reader.Reader):
         self.chunk_dims = [d.upper() for d in self.chunk_dims]
 
         # Construct the delayed dask array
-        selected_scene = lif.get_image(self.current_scene_index)
-        selected_scene_shape: List[int] = []
-        for dim in selected_scene_dims:
-            if dim == dimensions.DimensionNames.MosaicTile:
-                selected_scene_shape.append(selected_scene.n_mosaic)
-            elif dim == dimensions.DimensionNames.Time:
-                selected_scene_shape.append(selected_scene.nt)
-            elif dim == dimensions.DimensionNames.Channel:
-                selected_scene_shape.append(selected_scene.channels)
-            elif dim == dimensions.DimensionNames.SpatialZ:
-                selected_scene_shape.append(selected_scene.nz)
-            elif dim == dimensions.DimensionNames.SpatialY:
-                selected_scene_shape.append(selected_scene.info["dims"].y)
-            elif dim == dimensions.DimensionNames.SpatialX:
-                selected_scene_shape.append(selected_scene.info["dims"].x)
-
-        # Get sample for dtype
-        sample_plane = np.asarray(selected_scene.get_frame())
+        selected_scene_shape = [image.sizes.get(dim, 1) for dim in selected_scene_dims]
 
         # Constuct the chunk and non-chunk shapes one dim at a time
         # We also collect the chunk and non-chunk dimension order so that
@@ -386,7 +286,7 @@ class Reader(reader.Reader):
                     retrieve_indices=retrieve_indices,
                 ),
                 shape=chunk_shape,
-                dtype=sample_plane.dtype,
+                dtype=image.dtype,
             )
 
         # Convert the numpy array of lazy readers into a dask array
@@ -412,20 +312,14 @@ class Reader(reader.Reader):
 
     @staticmethod
     def _get_coords_and_physical_px_sizes(
-        xml: ET.Element, image_short_info: Dict[str, Any], scene_index: int
+        image_xml: ET.Element, sizes: Dict[str, int]
     ) -> Tuple[Dict[str, Any], types.PhysicalPixelSizes]:
         # Create coord dict
         coords: Dict[str, Any] = {}
 
-        # Get all images
-        img_sets = xml.findall(".//Image")
-
-        # Select the current scene
-        img = img_sets[scene_index]
-
         # Construct channel list
-        channels = img.findall(".//ChannelDescription")
-        channel_details = img.findall(".//WideFieldChannelInfo")
+        channels = image_xml.findall(".//ChannelDescription")
+        channel_details = image_xml.findall(".//WideFieldChannelInfo")
 
         detail_by_lut: Dict[str, ET.Element] = {}
         for detail in channel_details:
@@ -448,37 +342,33 @@ class Reader(reader.Reader):
         # Attach channel names to coords
         coords[dimensions.DimensionNames.Channel] = scene_channel_list
 
-        # Unpack short info scales
-        scale_x, scale_y, scale_z, scale_t = image_short_info["scale"]
+        # Physical scale per dimension: µm/px for spatial dimensions, s/frame for time
+        scales: Dict[str, float] = {}
+        for dim_desc in image_xml.findall(".//DimensionDescription"):
+            dim = LIF_DIM_ID_TO_NAME.get(dim_desc.attrib["DimID"])
+            n_elements = int(dim_desc.attrib["NumberOfElements"])
+            if dim is None or n_elements < 2:
+                continue
+            scale = float(dim_desc.attrib["Length"]) / (n_elements - 1)
+            if dim_desc.attrib.get("Unit") == "m":
+                scale *= 1e6
+            scales[dim] = scale
 
-        # Scales from readlif are returned as px/µm
-        # We want to return as µm/px
-        scale_x = 1 / scale_x if scale_x is not None else None
-        scale_y = 1 / scale_y if scale_y is not None else None
-        scale_z = 1 / scale_z if scale_z is not None else None
-
-        # Handle Spatial Dimensions
-        if scale_z is not None:
-            coords[dimensions.DimensionNames.SpatialZ] = Reader._generate_coord_array(
-                0, image_short_info["dims"].z, scale_z
-            )
-        if scale_y is not None:
-            coords[dimensions.DimensionNames.SpatialY] = Reader._generate_coord_array(
-                0, image_short_info["dims"].y, scale_y
-            )
-        if scale_x is not None:
-            coords[dimensions.DimensionNames.SpatialX] = Reader._generate_coord_array(
-                0, image_short_info["dims"].x, scale_x
-            )
-
-        # Time
-        if scale_t is not None:
-            coords[dimensions.DimensionNames.Time] = Reader._generate_coord_array(
-                0, image_short_info["dims"].t, scale_t
-            )
+        for dim in [
+            dimensions.DimensionNames.SpatialZ,
+            dimensions.DimensionNames.SpatialY,
+            dimensions.DimensionNames.SpatialX,
+            dimensions.DimensionNames.Time,
+        ]:
+            if dim in scales:
+                coords[dim] = Reader._generate_coord_array(0, sizes[dim], scales[dim])
 
         # Create physical pixal sizes
-        px_sizes = types.PhysicalPixelSizes(scale_z, scale_y, scale_x)
+        px_sizes = types.PhysicalPixelSizes(
+            scales.get(dimensions.DimensionNames.SpatialZ),
+            scales.get(dimensions.DimensionNames.SpatialY),
+            scales.get(dimensions.DimensionNames.SpatialX),
+        )
 
         return coords, px_sizes
 
@@ -498,43 +388,37 @@ class Reader(reader.Reader):
             The file could not be read or is not supported.
         """
         with self._fs.open(self._path) as open_resource:
-            lif = LifFile(open_resource)
-            selected_scene = lif.get_image(self.current_scene_index)
-            self._scene_short_info = selected_scene.info
+            with LifFile(open_resource) as lif:
+                image = lif.images[self.current_scene_index]
+                self._tilescan = image.tilescan
 
-            # Check for mosaic tiles
-            tile_positions = self._scene_short_info["mosaic_position"]
+                # If there are tiles in the image use mosaic dims. liffile drops
+                # length-1 dimensions, so a single-tile scan is not a mosaic here
+                if dimensions.DimensionNames.MosaicTile in image.sizes:
+                    dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST_WITH_MOSAIC_TILES
 
-            # If there are tiles in the image use mosaic dims
-            if len(tile_positions) > 0:
-                dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST_WITH_MOSAIC_TILES
+                # Otherwise use standard dims
+                else:
+                    dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST
 
-            # Otherwise use standard dims
-            else:
-                dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST
+                # Get image data
+                image_data = self._create_dask_array(image, dims)
 
-            # Get image data
-            image_data = self._create_dask_array(lif, dims)
+                # Create coordinate planes
+                coords, px_sizes = self._get_coords_and_physical_px_sizes(
+                    image_xml=image.xml_element.find("Data/Image"),
+                    sizes={dim: image.sizes.get(dim, 1) for dim in dims},
+                )
 
-            # Get metadata
-            meta = lif.xml_root
+                # Store pixel sizes
+                self._physical_pixel_sizes = px_sizes
 
-            # Create coordinate planes
-            coords, px_sizes = self._get_coords_and_physical_px_sizes(
-                xml=meta,
-                image_short_info=self._scene_short_info,
-                scene_index=self.current_scene_index,
-            )
-
-            # Store pixel sizes
-            self._physical_pixel_sizes = px_sizes
-
-            return xr.DataArray(
-                image_data,
-                dims=dims,
-                coords=coords,
-                attrs={constants.METADATA_UNPROCESSED: meta},
-            )
+                return xr.DataArray(
+                    image_data,
+                    dims=dims,
+                    coords=coords,
+                    attrs={constants.METADATA_UNPROCESSED: lif.xml_element},
+                )
 
     def _read_immediate(self) -> xr.DataArray:
         """
@@ -552,58 +436,68 @@ class Reader(reader.Reader):
             The file could not be read or is not supported.
         """
         with self._fs.open(self._path) as open_resource:
-            lif = LifFile(open_resource)
-            selected_scene = lif.get_image(self.current_scene_index)
-            self._scene_short_info = selected_scene.info
+            with LifFile(open_resource) as lif:
+                image = lif.images[self.current_scene_index]
+                self._tilescan = image.tilescan
 
-            # Check for mosaic tiles
-            tile_positions = self._scene_short_info["mosaic_position"]
+                # If there are tiles in the image use mosaic dims. liffile drops
+                # length-1 dimensions, so a single-tile scan is not a mosaic here
+                if dimensions.DimensionNames.MosaicTile in image.sizes:
+                    dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST_WITH_MOSAIC_TILES
 
-            # If there are tiles in the image use mosaic dims
-            if len(tile_positions) > 0:
-                dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST_WITH_MOSAIC_TILES
+                # Otherwise use standard dims
+                else:
+                    dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST
 
-            # Otherwise use standard dims
-            else:
-                dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST
+                # Get image data
+                image_data = self._get_image_data(
+                    fs=self._fs,
+                    path=self._path,
+                    scene=self.current_scene_index,
+                    retrieve_dims=dims,
+                    retrieve_indices=[None] * len(dims),  # Get all planes
+                )
 
-            # Get image data
-            image_data = self._get_image_data(
-                fs=self._fs,
-                path=self._path,
-                scene=self.current_scene_index,
-                retrieve_dims=dims,
-                retrieve_indices=[None] * len(dims),  # Get all planes
+                # Create coordinate planes
+                coords, px_sizes = self._get_coords_and_physical_px_sizes(
+                    image_xml=image.xml_element.find("Data/Image"),
+                    sizes={dim: image.sizes.get(dim, 1) for dim in dims},
+                )
+
+                # Store pixel sizes
+                self._physical_pixel_sizes = px_sizes
+
+                return xr.DataArray(
+                    image_data,
+                    dims=dims,
+                    coords=coords,
+                    attrs={constants.METADATA_UNPROCESSED: lif.xml_element},
+                )
+
+    @property
+    def _tiles(self) -> np.ndarray:
+        """
+        The tile scan info for the current scene as a structured array with
+        `field_x` and `field_y` grid positions for each tile.
+        """
+        # The tile scan info is read alongside the image data
+        self.dims
+
+        if self._tilescan is None:
+            raise exceptions.UnexpectedShapeError(
+                "No mosaic tile information in image."
             )
 
-            # Get metadata
-            meta = lif.xml_root
-
-            # Create coordinate planes
-            coords, px_sizes = self._get_coords_and_physical_px_sizes(
-                xml=meta,
-                image_short_info=self._scene_short_info,
-                scene_index=self.current_scene_index,
-            )
-
-            # Store pixel sizes
-            self._physical_pixel_sizes = px_sizes
-
-            return xr.DataArray(
-                image_data,
-                dims=dims,
-                coords=coords,
-                attrs={constants.METADATA_UNPROCESSED: meta},
-            )
+        return self._tilescan.tiles
 
     def _stitch_tiles(
         self,
         data: types.ArrayLike,
         dims: str,
-        mosaic_position: List[Tuple[int, int, float, float]],
+        tiles: np.ndarray,
     ) -> types.ArrayLike:
         """
-        This uses the mosaic_position of the LIF file to index into the data array,
+        This uses the tile scan info of the LIF file to index into the data array,
         retrieve the tile, transform it, and then recreate the XY plane of the tiles
         before eventually combining them back together into one array (representing
         the stitched mosaic image).
@@ -623,10 +517,10 @@ class Reader(reader.Reader):
         number_of_rows, number_of_columns = self._get_yx_tile_count()
         xy_plane = np.zeros((number_of_rows, number_of_columns), dtype=object)
 
-        # Iterate over each mosaic_position coordinate using the relative
-        # field position (XY coordinate) given to retrieve each tile from
+        # Iterate over each tile using the relative field position
+        # (XY coordinate) given to retrieve each tile from
         # the data array, transform it, and put back into a 2D (XY) array
-        for tile_index, tile_position, *_ in enumerate(mosaic_position):
+        for tile_index, tile_position in enumerate(tiles):
             # Get tile by getting all data for specific M
             tile = transforms.reshape_data(
                 data,
@@ -635,7 +529,8 @@ class Reader(reader.Reader):
                 M=tile_index,
             )
 
-            column_index, row_index, *_ = tile_position
+            column_index = int(tile_position["field_x"])
+            row_index = int(tile_position["field_y"])
             if self.is_x_and_y_swapped:
                 column_index, row_index = row_index, column_index
 
@@ -666,16 +561,11 @@ class Reader(reader.Reader):
         return np.concatenate(rows, axis=-2)
 
     def _construct_mosaic_xarray(self, data: types.ArrayLike) -> xr.DataArray:
-        # Get max of mosaic positions from lif
-        with self._fs.open(self._path) as open_resource:
-            lif = LifFile(open_resource)
-            selected_scene = lif.get_image(self.current_scene_index)
-
         # Stitch
         stitched = self._stitch_tiles(
             data=data,
             dims=self.dims.order,
-            mosaic_position=selected_scene.mosaic_position,
+            tiles=self._tiles,
         )
 
         # Copy metadata
@@ -696,17 +586,14 @@ class Reader(reader.Reader):
         }
 
         # Add expanded Y and X coords
-        scale_x, scale_y, _, _ = selected_scene.info["scale"]
-        scale_x = 1 / scale_x if scale_x is not None else None
-        scale_y = 1 / scale_y if scale_y is not None else None
-
-        if scale_y is not None:
+        px_sizes = self.physical_pixel_sizes
+        if px_sizes.Y is not None:
             coords[dimensions.DimensionNames.SpatialY] = Reader._generate_coord_array(
-                0, stitched.shape[-2], scale_y
+                0, stitched.shape[-2], px_sizes.Y
             )
-        if scale_x is not None:
+        if px_sizes.X is not None:
             coords[dimensions.DimensionNames.SpatialX] = Reader._generate_coord_array(
-                0, stitched.shape[-1], scale_x
+                0, stitched.shape[-1], px_sizes.X
             )
 
         attrs = copy(self.xarray_dask_data.attrs)
@@ -738,17 +625,13 @@ class Reader(reader.Reader):
         X dimension length: int
             The number of tiles along the X axis.
         """
-        # Determine the length of the x dimension (i.e. number of columns in XY plane)
-        x_dim_length = 1
-        for x, *_ in self._scene_short_info["mosaic_position"]:
-            if x + 1 > x_dim_length:
-                x_dim_length = x + 1
+        tiles = self._tiles
 
-        # The length of the mosaic_position array == X * Y so
-        # Y = (X * Y) / X
-        y_dim_length = floor(
-            len(self._scene_short_info["mosaic_position"]) / x_dim_length
-        )
+        # Determine the length of the x dimension (i.e. number of columns in XY plane)
+        x_dim_length = int(tiles["field_x"].max()) + 1
+
+        # The number of tiles == X * Y so Y = (X * Y) / X
+        y_dim_length = len(tiles) // x_dim_length
 
         if self.is_x_and_y_swapped:
             y_dim_length, x_dim_length = x_dim_length, y_dim_length
@@ -790,7 +673,7 @@ class Reader(reader.Reader):
     ) -> Tuple[int, int]:
         """
         Get the absolute position of the top left point for a single mosaic tile.
-        Not equivalent to readlif's notion of mosaic_position.
+        Not equivalent to the stage positions in the LIF tile scan info.
 
         Parameters
         ----------
@@ -830,9 +713,9 @@ class Reader(reader.Reader):
 
         # LIFs are packed from bottom right to top left
         # To counter: subtract 1 + M from list index to get from back of list
-        index_x, index_y, _, _ = self._scene_short_info["mosaic_position"][
-            -(mosaic_tile_index + 1)
-        ]
+        tile = self._tiles[-(mosaic_tile_index + 1)]
+        index_x = int(tile["field_x"])
+        index_y = int(tile["field_y"])
         y_dim_length, x_dim_length = self._get_yx_tile_count()
 
         if self.is_x_and_y_swapped:
@@ -887,15 +770,13 @@ class Reader(reader.Reader):
                 + "mosaic tile index (M) by using .get_mosaic_tile_position() instead."
             )
 
-        mosaic_positions: List[Tuple[int, int, float, float]] = self._scene_short_info[
-            "mosaic_position"
-        ]
-
         # LIFs are packed from bottom right to top left
         # To counter: read the positions in reverse
         adjusted_mosaic_positions: List[Tuple[int, int]] = []
         y_dim_length, x_dim_length = self._get_yx_tile_count()
-        for x, y, *_ in reversed(mosaic_positions):
+        for tile in self._tiles[::-1]:
+            x = int(tile["field_x"])
+            y = int(tile["field_y"])
             if self.is_x_and_y_swapped:
                 x, y = y, x
             if self.is_x_flipped:
