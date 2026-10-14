@@ -54,6 +54,21 @@ from .conftest import LOCAL_RESOURCES_DIR
             ["Gray", "Red", "Green", "Cyan"],
             (None, 0.2006131115459883, 0.2006131115459883),
         ),
+        # A tile scan with a single tile is not a mosaic
+        (
+            "single_tile_scan.lif",
+            "sg30 control 48 hr after transfection 10x",
+            (
+                "sg30 control 48 hr after transfection",
+                "sg30 control 48 hr after transfection 10x",
+                "sg30 control 48 hr after transfection_higher exposure",
+            ),
+            (1, 3, 1, 1024, 1024),
+            np.uint16,
+            dimensions.DEFAULT_DIMENSION_ORDER,
+            ["Gray--TL-BF--EMP_BF", "Red--FLUO--TXR", "Green"],
+            (None, 1.3182248289345062, 1.3182248289345062),
+        ),
         pytest.param(
             "example.txt",
             None,
@@ -126,8 +141,6 @@ def test_sanity_check_correct_indexing(
     # Pull a chunk from LifReader
     chunk_from_lif_reader = reader.get_image_dask_data(get_dims).compute()
 
-    # Pull what should be the same chunk directly from liffile:
-    # every plane along the requested non-YX dimension, all other dimensions at 0
     with LifFile(uri) as lif:
         lif_img = lif.images[0]
         selection: Dict[str, Optional[int]] = {
