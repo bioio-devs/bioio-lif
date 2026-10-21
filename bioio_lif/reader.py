@@ -15,7 +15,7 @@ from bioio_base import constants, dimensions, exceptions, io, reader, transforms
 from bioio_base.standard_metadata import StandardMetadata
 from dask import delayed
 from fsspec.spec import AbstractFileSystem
-from liffile import LifFile, LifImageABC, LifTileScanInfo
+from liffile import LifFile, LifFlimImage, LifImageABC, LifTileScanInfo
 
 from .io import search_for_node
 
@@ -81,6 +81,7 @@ class Reader(reader.Reader):
     _metadata: Optional[Any] = None
     _physical_pixel_sizes: Optional[types.PhysicalPixelSizes] = None
     _scenes: Optional[Tuple[str, ...]] = None
+    _image_indices: List[int]
     _current_scene_index: int = 0
     _tilescan: Optional[LifTileScanInfo] = None
     # Do not provide default value because
@@ -146,8 +147,27 @@ class Reader(reader.Reader):
         if self._scenes is None:
             with self._fs.open(self._path) as open_resource:
                 with LifFile(open_resource) as lif:
-                    self._scenes = tuple(image.path for image in lif.images)
+                    # Images derived from a raw FLIM image are read through it
+                    flim_prefixes = tuple(
+                        f"{image.path}/"
+                        for image in lif.images
+                        if isinstance(image, LifFlimImage)
+                    )
+                    self._image_indices = [
+                        index
+                        for index, image in enumerate(lif.images)
+                        if not image.path.startswith(flim_prefixes)
+                    ]
+                    self._scenes = tuple(
+                        lif.images[index].path for index in self._image_indices
+                    )
         return self._scenes
+
+    @property
+    def _image_index(self) -> int:
+        """The index in the file of the current scene's image."""
+        self.scenes
+        return self._image_indices[self.current_scene_index]
 
     @staticmethod
     def _get_image_data(
@@ -193,6 +213,7 @@ class Reader(reader.Reader):
                     not in [
                         dimensions.DimensionNames.SpatialY,
                         dimensions.DimensionNames.SpatialX,
+                        dimensions.DimensionNames.Samples,
                     ]
                 }
                 frames = image.frames(**selection)
@@ -216,7 +237,7 @@ class Reader(reader.Reader):
                 )
 
     def _create_dask_array(
-        self, image: LifImageABC, selected_scene_dims: List[str]
+        self, image: LifImageABC, selected_scene_dims: List[str], scene_index: int
     ) -> xr.DataArray:
         """
         Creates a delayed dask array for the file.
@@ -227,6 +248,8 @@ class Reader(reader.Reader):
             The selected scene from an open LifFile.
         selected_scene_dims: List[str]
             The dimensions for the scene to create the dask array for
+        scene_index: int
+            The index of the image in the file.
 
         Returns
         -------
@@ -252,7 +275,7 @@ class Reader(reader.Reader):
         chunk_dim_order = []
         chunk_shape = []
         for dim, size in zip(selected_scene_dims, selected_scene_shape):
-            if dim in self.chunk_dims:
+            if dim in self.chunk_dims or dim == dimensions.DimensionNames.Samples:
                 chunk_dim_order.append(dim)
                 chunk_shape.append(size)
 
@@ -281,7 +304,7 @@ class Reader(reader.Reader):
                 delayed(Reader._get_image_data)(
                     fs=self._fs,
                     path=self._path,
-                    scene=self.current_scene_index,
+                    scene=scene_index,
                     retrieve_dims=blocked_dim_order,
                     retrieve_indices=retrieve_indices,
                 ),
@@ -340,7 +363,8 @@ class Reader(reader.Reader):
             scene_channel_list.append(name)
 
         # Attach channel names to coords
-        coords[dimensions.DimensionNames.Channel] = scene_channel_list
+        if len(scene_channel_list) == sizes[dimensions.DimensionNames.Channel]:
+            coords[dimensions.DimensionNames.Channel] = scene_channel_list
 
         # Physical scale per dimension: µm/px for spatial dimensions, s/frame for time
         scales: Dict[str, float] = {}
@@ -351,6 +375,8 @@ class Reader(reader.Reader):
                 continue
             scale = float(dim_desc.attrib["Length"]) / (n_elements - 1)
             if dim_desc.attrib.get("Unit") == "m":
+                if scale == 1:
+                    continue
                 scale *= 1e6
             scales[dim] = scale
 
@@ -372,6 +398,110 @@ class Reader(reader.Reader):
 
         return coords, px_sizes
 
+    def _read_flim(
+        self, lif: LifFile, image: LifFlimImage, delayed: bool
+    ) -> xr.DataArray:
+        """
+        Construct a FLIM image from its derived maps.
+
+        liffile cannot decode the raw FLIM histograms, so the data is the maps Leica
+        computed from them, as float32 channels grouped by the channel they describe.
+        """
+        # The maps are on the physical grid, unlike the unitless plot and mask images
+        dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST
+        maps = []
+        for child in image.child_images:
+            _, child_px_sizes = self._get_coords_and_physical_px_sizes(
+                image_xml=child.xml_element.find("Data/Image"),
+                sizes={dim: child.sizes.get(dim, 1) for dim in dims},
+            )
+            if child_px_sizes.X is not None:
+                maps.append(child)
+
+        parent = image.parent_image
+        if not maps or parent is None:
+            raise NotImplementedError(
+                "Raw FLIM histogram data cannot be read by liffile and "
+                "this image has no derived maps to read instead."
+            )
+
+        # The maps describe the parent's photon counting channels, in order
+        flim_channels = []
+        for description in parent.xml_element.findall(
+            "Data/Image/ImageDescription/Channels/ChannelDescription"
+        ):
+            properties = {
+                prop.findtext("Key"): prop.findtext("Value")
+                for prop in description.findall("ChannelProperty")
+            }
+            if properties.get("ChannelType") == "PhotonCounting":
+                dye = properties.get("DyeName")
+                flim_channels.append(
+                    dye.rsplit("/", 1)[-1] if dye else description.attrib["LUTName"]
+                )
+
+        channel_axis = dims.index(dimensions.DimensionNames.Channel)
+        z_axis = dims.index(dimensions.DimensionNames.SpatialZ)
+        image_index_by_path = {img.path: i for i, img in enumerate(lif.images)}
+        arrays: List[Any] = []
+        array: Any
+        for m in maps:
+            if delayed:
+                array = self._create_dask_array(m, dims, image_index_by_path[m.path])
+            else:
+                array = self._get_image_data(
+                    fs=self._fs,
+                    path=self._path,
+                    scene=image_index_by_path[m.path],
+                    retrieve_dims=dims,
+                    retrieve_indices=[None] * len(dims),
+                )
+            arrays.append(array.astype(np.float32))
+
+        if any(a.shape[channel_axis] != len(flim_channels) for a in arrays):
+            raise ValueError(
+                f"The FLIM maps do not match the {len(flim_channels)} photon "
+                "counting channels of the parent image."
+            )
+
+        # Leica allocates the maps for the planned stack, so an acquisition stopped
+        # early leaves empty planes past the ones the parent image holds
+        acquired_z = parent.sizes.get(dimensions.DimensionNames.SpatialZ, 1)
+        if arrays[0].shape[z_axis] > acquired_z:
+            log.warning(
+                "FLIM maps have %d z-planes but only %d were acquired; "
+                "dropping the empty planes.",
+                arrays[0].shape[z_axis],
+                acquired_z,
+            )
+            arrays = [a[:, :, :acquired_z] for a in arrays]
+
+        channel_arrays = [
+            a[:, c : c + 1] for c in range(len(flim_channels)) for a in arrays
+        ]
+        image_data: Any
+        if delayed:
+            image_data = da.concatenate(channel_arrays, axis=channel_axis)
+        else:
+            image_data = np.concatenate(channel_arrays, axis=channel_axis)
+
+        coords, self._physical_pixel_sizes = self._get_coords_and_physical_px_sizes(
+            image_xml=maps[0].xml_element.find("Data/Image"),
+            sizes=dict(zip(dims, arrays[0].shape)),
+        )
+        coords[dimensions.DimensionNames.Channel] = [
+            f"{channel} {m.path.rsplit('/', 1)[1]}"
+            for channel in flim_channels
+            for m in maps
+        ]
+
+        return xr.DataArray(
+            image_data,
+            dims=dims,
+            coords=coords,
+            attrs={constants.METADATA_UNPROCESSED: lif.xml_element},
+        )
+
     def _read_delayed(self) -> xr.DataArray:
         """
         Construct the delayed xarray DataArray object for the image.
@@ -389,20 +519,27 @@ class Reader(reader.Reader):
         """
         with self._fs.open(self._path) as open_resource:
             with LifFile(open_resource) as lif:
-                image = lif.images[self.current_scene_index]
+                image = lif.images[self._image_index]
                 self._tilescan = image.tilescan
+
+                if isinstance(image, LifFlimImage):
+                    return self._read_flim(lif, image, delayed=True)
 
                 # If there are tiles in the image use mosaic dims. liffile drops
                 # length-1 dimensions, so a single-tile scan is not a mosaic here
                 if dimensions.DimensionNames.MosaicTile in image.sizes:
                     dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST_WITH_MOSAIC_TILES
 
+                # RGB images store their colors as samples
+                elif dimensions.DimensionNames.Samples in image.sizes:
+                    dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST_WITH_SAMPLES
+
                 # Otherwise use standard dims
                 else:
                     dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST
 
                 # Get image data
-                image_data = self._create_dask_array(image, dims)
+                image_data = self._create_dask_array(image, dims, self._image_index)
 
                 # Create coordinate planes
                 coords, px_sizes = self._get_coords_and_physical_px_sizes(
@@ -437,13 +574,20 @@ class Reader(reader.Reader):
         """
         with self._fs.open(self._path) as open_resource:
             with LifFile(open_resource) as lif:
-                image = lif.images[self.current_scene_index]
+                image = lif.images[self._image_index]
                 self._tilescan = image.tilescan
+
+                if isinstance(image, LifFlimImage):
+                    return self._read_flim(lif, image, delayed=False)
 
                 # If there are tiles in the image use mosaic dims. liffile drops
                 # length-1 dimensions, so a single-tile scan is not a mosaic here
                 if dimensions.DimensionNames.MosaicTile in image.sizes:
                     dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST_WITH_MOSAIC_TILES
+
+                # RGB images store their colors as samples
+                elif dimensions.DimensionNames.Samples in image.sizes:
+                    dims = dimensions.DEFAULT_DIMENSION_ORDER_LIST_WITH_SAMPLES
 
                 # Otherwise use standard dims
                 else:
@@ -453,7 +597,7 @@ class Reader(reader.Reader):
                 image_data = self._get_image_data(
                     fs=self._fs,
                     path=self._path,
-                    scene=self.current_scene_index,
+                    scene=self._image_index,
                     retrieve_dims=dims,
                     retrieve_indices=[None] * len(dims),  # Get all planes
                 )
@@ -825,6 +969,12 @@ class Reader(reader.Reader):
             for row_elem in self.metadata.findall(".//Element"):
                 row_name = row_elem.attrib.get("Name")
                 if not row_name or not row_name.isalpha():
+                    continue
+                # Images, FLIM images included, are not wells
+                if (
+                    row_elem.find("Data/Image") is not None
+                    or row_elem.find("Data/SingleMoleculeDetection") is not None
+                ):
                     continue
                 for col_elem in row_elem.findall("./Children/Element"):
                     col_name = col_elem.attrib.get("Name")

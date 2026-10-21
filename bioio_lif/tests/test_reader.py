@@ -357,8 +357,46 @@ def test_channel_name_matching(
     expected_channel_names: List[str],
 ) -> None:
     xml = ET.fromstring(channel_xml)
-    sizes = {"T": 1, "C": 2, "Z": 1, "Y": 2, "X": 2}
+    sizes = {"T": 1, "C": len(expected_channel_names), "Z": 1, "Y": 2, "X": 2}
 
     coords, _ = Reader._get_coords_and_physical_px_sizes(xml, sizes)
 
     assert list(coords[dimensions.DimensionNames.Channel]) == expected_channel_names
+
+
+def test_channel_names_skipped_when_they_describe_samples() -> None:
+    # RGB images describe their colors as channels but store them as samples
+    xml = ET.fromstring(
+        """
+        <root><Image>
+        <ChannelDescription LUTName="Red"/>
+        <ChannelDescription LUTName="Green"/>
+        <ChannelDescription LUTName="Blue"/>
+        </Image></root>
+        """
+    )
+    sizes = {"T": 1, "C": 1, "Z": 1, "Y": 2, "X": 2}
+
+    coords, _ = Reader._get_coords_and_physical_px_sizes(xml, sizes)
+
+    assert dimensions.DimensionNames.Channel not in coords
+
+
+def test_unitless_dimensions_have_no_physical_pixel_size() -> None:
+    # Leica writes 1 m per pixel for images without physical units
+    xml = ET.fromstring(
+        """
+        <root><Image>
+        <DimensionDescription DimID="1" NumberOfElements="512" Length="5.11e+02"
+            Unit="m"/>
+        <DimensionDescription DimID="2" NumberOfElements="300" Length="2.99e+02"
+            Unit="m"/>
+        </Image></root>
+        """
+    )
+    sizes = {"T": 1, "C": 1, "Z": 1, "Y": 300, "X": 512}
+
+    coords, px_sizes = Reader._get_coords_and_physical_px_sizes(xml, sizes)
+
+    assert px_sizes == (None, None, None)
+    assert dimensions.DimensionNames.SpatialX not in coords
