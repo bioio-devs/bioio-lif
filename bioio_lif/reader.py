@@ -1027,7 +1027,12 @@ class Reader(reader.Reader):
             Acquisition start time. Returns None if unavailable or malformed.
         """
         try:
-            timestamp_list_node = search_for_node(self.metadata, "TimeStampList")
+            # Search the current scene, not the whole file, so that each scene
+            # reports its own start time
+            with self._fs.open(self._path) as open_resource:
+                with LifFile(open_resource) as lif:
+                    scene_xml = lif.images[self.current_scene_index].xml_element
+            timestamp_list_node = search_for_node(scene_xml, "TimeStampList")
             if timestamp_list_node is None:
                 raise ValueError("TimeStampList node not found in metadata.")
             if timestamp_list_node.text is None:
