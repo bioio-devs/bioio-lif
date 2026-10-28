@@ -13,6 +13,30 @@ from bioio_lif import Reader
 
 from .conftest import LOCAL_RESOURCES_DIR
 
+FLIM_MAPS = [
+    "Intensity",
+    "Fast Flim",
+    "Standard Deviation",
+    "Phasor Real",
+    "Phasor Imaginary",
+    "Phasor Intensity",
+]
+
+FLIM_SINGLE_CHANNEL_SCENES = (
+    "100um Lumenoid",
+    "100um Lumenoid/FLIM",
+    "FLIM with TL PMT 2",
+    "FLIM with TL PMT 2/FLIM Compressed",
+    "FLIM with TL PMT 3 LUT",
+)
+
+FLIM_MULTI_CHANNEL_SCENES = (
+    "flipt_actin_mannitol",
+    "flipt_actin_mannitol/FLIM",
+    "neg_ctrol",
+    "neg_ctrol/FLIM",
+)
+
 
 @pytest.mark.parametrize(
     "filename, "
@@ -68,6 +92,65 @@ from .conftest import LOCAL_RESOURCES_DIR
             dimensions.DEFAULT_DIMENSION_ORDER,
             ["Gray--TL-BF--EMP_BF", "Red--FLUO--TXR", "Green"],
             (None, 1.3182248289345062, 1.3182248289345062),
+        ),
+        # FLIM maps on a 2x binned grid, with a z-stack
+        (
+            "flim_single_channel.lif",
+            "100um Lumenoid/FLIM",
+            FLIM_SINGLE_CHANNEL_SCENES,
+            (1, 6, 3, 16, 16),
+            np.float32,
+            dimensions.DEFAULT_DIMENSION_ORDER,
+            [f"Flipper TR {m}" for m in FLIM_MAPS],
+            (2.2170825, 0.5990620666666666, 0.5990620666666666),
+        ),
+        # Only one of the two parent channels is photon counting
+        (
+            "flim_single_channel.lif",
+            "FLIM with TL PMT 2/FLIM Compressed",
+            FLIM_SINGLE_CHANNEL_SCENES,
+            (1, 6, 1, 16, 16),
+            np.float32,
+            dimensions.DEFAULT_DIMENSION_ORDER,
+            [f"Flipper TR {m}" for m in FLIM_MAPS],
+            (None, 0.5990620666666666, 0.5990620666666666),
+        ),
+        # Two FLIM channels over time
+        (
+            "flim_multi_channel.lif",
+            "flipt_actin_mannitol/FLIM",
+            FLIM_MULTI_CHANNEL_SCENES,
+            (2, 12, 3, 16, 16),
+            np.float32,
+            dimensions.DEFAULT_DIMENSION_ORDER,
+            [f"{dye} {m}" for dye in ("Flipper TR", "ALEXA 647") for m in FLIM_MAPS],
+            (2.568375, 0.5201008666666667, 0.5201008666666667),
+        ),
+        # The maps hold more z-planes than were acquired, so the extra are dropped
+        (
+            "flim_multi_channel.lif",
+            "neg_ctrol/FLIM",
+            FLIM_MULTI_CHANNEL_SCENES,
+            (1, 18, 3, 32, 32),
+            np.float32,
+            dimensions.DEFAULT_DIMENSION_ORDER,
+            [
+                f"{dye} {m}"
+                for dye in ("EGFP", "Flipper TR", "iRFP660")
+                for m in FLIM_MAPS
+            ],
+            (2.1525867499999998, 0.4595583870967742, 0.4595583870967742),
+        ),
+        # RGB images store their colors as samples
+        (
+            "flim_single_channel.lif",
+            "FLIM with TL PMT 3 LUT",
+            FLIM_SINGLE_CHANNEL_SCENES,
+            (1, 1, 1, 32, 32, 3),
+            np.uint16,
+            dimensions.DEFAULT_DIMENSION_ORDER + "S",
+            [0],
+            (None, 0.29015322580645164, 0.29015322580645164),
         ),
         pytest.param(
             "example.txt",
@@ -357,8 +440,57 @@ def test_channel_name_matching(
     expected_channel_names: List[str],
 ) -> None:
     xml = ET.fromstring(channel_xml)
-    sizes = {"T": 1, "C": 2, "Z": 1, "Y": 2, "X": 2}
+    sizes = {"T": 1, "C": len(expected_channel_names), "Z": 1, "Y": 2, "X": 2}
 
     coords, _ = Reader._get_coords_and_physical_px_sizes(xml, sizes)
 
     assert list(coords[dimensions.DimensionNames.Channel]) == expected_channel_names
+
+
+def test_channel_names_skipped_when_they_describe_samples() -> None:
+    # RGB images describe their colors as channels but store them as samples
+    xml = ET.fromstring(
+        """
+        <root><Image>
+        <ChannelDescription LUTName="Red"/>
+        <ChannelDescription LUTName="Green"/>
+        <ChannelDescription LUTName="Blue"/>
+        </Image></root>
+        """
+    )
+    sizes = {"T": 1, "C": 1, "Z": 1, "Y": 2, "X": 2}
+
+    coords, _ = Reader._get_coords_and_physical_px_sizes(xml, sizes)
+
+    assert dimensions.DimensionNames.Channel not in coords
+
+
+def test_unitless_dimensions_have_no_physical_pixel_size() -> None:
+    # Leica writes 1 m per pixel for images without physical units
+    xml = ET.fromstring(
+        """
+        <root><Image>
+        <DimensionDescription DimID="1" NumberOfElements="512" Length="5.11e+02"
+            Unit="m"/>
+        <DimensionDescription DimID="2" NumberOfElements="300" Length="2.99e+02"
+            Unit="m"/>
+        </Image></root>
+        """
+    )
+    sizes = {"T": 1, "C": 1, "Z": 1, "Y": 300, "X": 512}
+
+    coords, px_sizes = Reader._get_coords_and_physical_px_sizes(xml, sizes)
+
+    assert px_sizes == (None, None, None)
+    assert dimensions.DimensionNames.SpatialX not in coords
+
+
+def test_flim_channels_follow_parent_channel_order() -> None:
+    # The synthetic intensity grows with the channel index
+    reader = Reader(LOCAL_RESOURCES_DIR / "flim_multi_channel.lif")
+    reader.set_scene("neg_ctrol/FLIM")
+
+    data = reader.get_image_data("CZYX")
+    intensity_means = data[::6].mean(axis=(1, 2, 3))
+
+    assert list(intensity_means) == sorted(intensity_means)
