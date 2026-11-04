@@ -159,7 +159,7 @@ def test_sanity_check_correct_indexing(
 
 
 @pytest.mark.parametrize(
-    "tiles_filename, " "stitched_filename, " "tiles_set_scene, " "stitched_set_scene, ",
+    "tiles_filename, stitched_filename, tiles_set_scene, stitched_set_scene, ",
     [
         (
             "tiled.lif",
