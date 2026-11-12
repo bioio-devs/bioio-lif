@@ -19,9 +19,10 @@ def make_mock_reader(
 ) -> Reader:
     metadata = ET.parse(metadata_file).getroot()
 
-    with patch("bioio_base.io.pathlike_to_fs") as mock_fs_patch, patch(
-        "bioio_lif.reader.LifFile"
-    ) as mock_lif_patch:
+    with (
+        patch("bioio_base.io.pathlike_to_fs") as mock_fs_patch,
+        patch("bioio_lif.reader.LifFile") as mock_lif_patch,
+    ):
         mock_fs = MagicMock()
         mock_fs.exists.return_value = True
         mock_fs_patch.return_value = (mock_fs, "dummy_path.lif")
@@ -91,13 +92,13 @@ def test_metadata_properties(
     for property_name, expected in expected_values.items():
         result = getattr(reader, property_name)
         if isinstance(expected, datetime.timedelta):
-            assert isinstance(
-                result, datetime.timedelta
-            ), f"{property_name} should be a timedelta"
-            assert (
-                abs(result.total_seconds() - expected.total_seconds()) < 1e-1
-            ), f"{property_name} expected {expected}, got {result}"
+            assert isinstance(result, datetime.timedelta), (
+                f"{property_name} should be a timedelta"
+            )
+            assert abs(result.total_seconds() - expected.total_seconds()) < 1e-1, (
+                f"{property_name} expected {expected}, got {result}"
+            )
         else:
-            assert (
-                result == expected
-            ), f"{property_name} expected {expected}, got {result}"
+            assert result == expected, (
+                f"{property_name} expected {expected}, got {result}"
+            )
