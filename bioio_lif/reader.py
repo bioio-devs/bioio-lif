@@ -5,7 +5,6 @@ import datetime
 import logging
 import xml.etree.ElementTree as ET
 from copy import copy
-from dataclasses import dataclass
 from typing import Any, Dict, Hashable, List, Optional, Tuple, Union
 
 import dask.array as da
@@ -32,12 +31,6 @@ LIF_DIM_ID_TO_NAME = {
 }
 
 ###############################################################################
-
-
-@dataclass
-class WellPosition:
-    row: str
-    col: str
 
 
 class Reader(reader.Reader):
@@ -961,87 +954,65 @@ class Reader(reader.Reader):
         seconds_since_unix_epoch = seconds_since_filetime_epoch - 11644473600
         return datetime.datetime.utcfromtimestamp(seconds_since_unix_epoch)
 
+    def _element_at(self, path: str) -> ET.Element:
+        element = self.metadata.find("Element")
+        for name in path.split("/"):
+            element = next(
+                child
+                for child in element.findall("./Children/Element")
+                if child.attrib.get("Name") == name
+            )
+        return element
+
     @property
-    def _scene_to_well_map(self) -> Dict[int, WellPosition]:
-        if not hasattr(self, "__scene_to_well_map"):
-            scene_to_well_map = {}
-            index = 0
-            for row_elem in self.metadata.findall(".//Element"):
-                row_name = row_elem.attrib.get("Name")
-                if not row_name or not row_name.isalpha():
-                    continue
-                # Images, FLIM images included, are not wells
-                if (
-                    row_elem.find("Data/Image") is not None
-                    or row_elem.find("Data/SingleMoleculeDetection") is not None
-                ):
-                    continue
-                for col_elem in row_elem.findall("./Children/Element"):
-                    col_name = col_elem.attrib.get("Name")
-                    if col_name:
-                        scene_to_well_map[index] = WellPosition(
-                            row=row_name.upper(), col=col_name
-                        )
-                        index += 1
-            self.__scene_to_well_map = scene_to_well_map
-        return self.__scene_to_well_map
+    def _scene_element(self) -> ET.Element:
+        """The XML element at the current scene's path."""
+        return self._element_at(self.scenes[self.current_scene_index])
 
     @property
     def scene_root(self) -> ET.Element:
         """
-        Returns the XML node corresponding to the current scene.
+        Returns the XML node holding the current scene's own metadata.
 
-        Returns
-        -------
-        ET.Element
-            The XML element representing the scene node based on row and column.
-
-        Raises
-        ------
-        ValueError
-            If either the row or column value is missing.
+        For a FLIM scene this is the parent image, as the FLIM element carries no
+        timestamps or objective.
         """
-        if self.row is None or self.column is None:
-            raise ValueError(
-                "Row or column value is missing; cannot locate the scene node."
-            )
+        scene_path = self.scenes[self.current_scene_index]
+        if self._scene_element.find("Data/SingleMoleculeDetection") is None:
+            return self._scene_element
+        return self._element_at(scene_path.rsplit("/", 1)[0])
 
-        row_node = search_for_node(self.metadata, "Element", {"Name": self.row})
-        return search_for_node(row_node, "Element", {"Name": self.column})
+    @property
+    def _well(self) -> Optional[Tuple[str, str]]:
+        """The (row, column) from a plate scene path such as 'TileScan 1/B/2'."""
+        parts = self.scenes[self.current_scene_index].split("/")
+        if len(parts) >= 3 and parts[-2].isalpha() and len(parts[-2]) <= 2:
+            return parts[-2].upper(), parts[-1]
+        return None
 
     @property
     def column(self) -> Optional[str]:
         """
-        Extracts the well column index from the current scene name.
+        The well column, taken from the scene path.
 
         Returns
         -------
         Optional[str]
-            The column index as a string. Returns None if parsing fails.
+            The column. None if the scene is not in a plate.
         """
-        try:
-            pos = self._scene_to_well_map.get(self.current_scene_index)
-            return pos.col if pos else None
-        except Exception as exc:
-            log.warning("Failed to extract well column: %s", exc, exc_info=True)
-            return None
+        return self._well[1] if self._well else None
 
     @property
     def row(self) -> Optional[str]:
         """
-        Extracts the well row index from the current scene name.
+        The well row, taken from the scene path.
 
         Returns
         -------
         Optional[str]
-            The row index as a string. Returns None if parsing fails.
+            The row. None if the scene is not in a plate.
         """
-        try:
-            pos = self._scene_to_well_map.get(self.current_scene_index)
-            return pos.row if pos else None
-        except Exception as exc:
-            log.warning("Failed to extract well row: %s", exc, exc_info=True)
-            return None
+        return self._well[0] if self._well else None
 
     @property
     def binning(self) -> Optional[str]:
@@ -1055,6 +1026,9 @@ class Reader(reader.Reader):
             Returns None if not found or unknown.
         """
         try:
+            flim_binning = self._scene_element.find(".//FlimData/Binning")
+            if flim_binning is not None and flim_binning.text:
+                return f"{flim_binning.text.strip()}x{flim_binning.text.strip()}"
             camera_format_node = search_for_node(self.scene_root, "CameraFormat")
             binning = camera_format_node.get("Binning")
             live_binning = camera_format_node.get("LiveBinning")
@@ -1080,10 +1054,12 @@ class Reader(reader.Reader):
             The formatted objective (e.g., "10x/0.30"). Returns None if not found.
         """
         try:
-            camera_settings_node = search_for_node(
-                self.scene_root, "ATLCameraSettingDefinition"
-            )
-            objective_name = camera_settings_node.get("ObjectiveName")
+            settings_node = self.scene_root.find(".//ATLCameraSettingDefinition")
+            if settings_node is None:
+                settings_node = search_for_node(
+                    self.scene_root, "ATLConfocalSettingDefinition"
+                )
+            objective_name = settings_node.get("ObjectiveName")
             if objective_name is None:
                 raise ValueError("ObjectiveName attribute not found")
             return objective_name.strip()
@@ -1125,6 +1101,9 @@ class Reader(reader.Reader):
             t = getattr(self.dims, "T", 1)
 
             images_per_timepoint = m * c * z
+            if self._scene_element is not self.scene_root:
+                # FLIM dims count the derived maps, not the parent's channels
+                images_per_timepoint = len(timestamps) // t
             expected_total_timestamps = images_per_timepoint * t
 
             if images_per_timepoint == 0:
@@ -1177,7 +1156,7 @@ class Reader(reader.Reader):
             Acquisition start time. Returns None if unavailable or malformed.
         """
         try:
-            timestamp_list_node = search_for_node(self.metadata, "TimeStampList")
+            timestamp_list_node = search_for_node(self.scene_root, "TimeStampList")
             if timestamp_list_node is None:
                 raise ValueError("TimeStampList node not found in metadata.")
             if timestamp_list_node.text is None:
