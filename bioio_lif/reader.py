@@ -75,6 +75,7 @@ class Reader(reader.Reader):
     _physical_pixel_sizes: Optional[types.PhysicalPixelSizes] = None
     _scenes: Optional[Tuple[str, ...]] = None
     _image_indices: List[int]
+    _scene_xml_cache: Dict[int, Tuple[ET.Element, bool]]
     _current_scene_index: int = 0
     _tilescan: Optional[LifTileScanInfo] = None
     # Do not provide default value because
@@ -117,6 +118,7 @@ class Reader(reader.Reader):
             chunk_dims = list(chunk_dims)
 
         self.chunk_dims = chunk_dims
+        self._scene_xml_cache = {}
 
         # If either of these are True, the respective dimension will be
         # flipped along the other axis.
@@ -954,33 +956,24 @@ class Reader(reader.Reader):
         seconds_since_unix_epoch = seconds_since_filetime_epoch - 11644473600
         return datetime.datetime.utcfromtimestamp(seconds_since_unix_epoch)
 
-    def _element_at(self, path: str) -> ET.Element:
-        element = self.metadata.find("Element")
-        for name in path.split("/"):
-            element = next(
-                child
-                for child in element.findall("./Children/Element")
-                if child.attrib.get("Name") == name
-            )
-        return element
-
     @property
-    def _scene_element(self) -> ET.Element:
-        """The XML element at the current scene's path."""
-        return self._element_at(self.scenes[self.current_scene_index])
-
-    @property
-    def scene_root(self) -> ET.Element:
+    def _scene_xml(self) -> Tuple[ET.Element, bool]:
         """
-        Returns the XML node holding the current scene's own metadata.
+        The XML holding the current scene's metadata, and whether the scene is FLIM.
 
         For a FLIM scene this is the parent image, as the FLIM element carries no
         timestamps or objective.
         """
-        scene_path = self.scenes[self.current_scene_index]
-        if self._scene_element.find("Data/SingleMoleculeDetection") is None:
-            return self._scene_element
-        return self._element_at(scene_path.rsplit("/", 1)[0])
+        if self._scene_xml_cache.get(self.current_scene_index) is None:
+            with self._fs.open(self._path) as open_resource:
+                with LifFile(open_resource) as lif:
+                    image = lif.images[self._image_index]
+                    source = image.parent_image if image.is_flim else image
+                    self._scene_xml_cache[self.current_scene_index] = (
+                        source.xml_element,
+                        image.is_flim,
+                    )
+        return self._scene_xml_cache[self.current_scene_index]
 
     @property
     def _well(self) -> Optional[Tuple[str, str]]:
@@ -1026,10 +1019,10 @@ class Reader(reader.Reader):
             Returns None if not found or unknown.
         """
         try:
-            flim_binning = self._scene_element.find(".//FlimData/Binning")
+            flim_binning = self._scene_xml[0].find(".//FlimData/Binning")
             if flim_binning is not None and flim_binning.text:
                 return f"{flim_binning.text.strip()}x{flim_binning.text.strip()}"
-            camera_format_node = search_for_node(self.scene_root, "CameraFormat")
+            camera_format_node = search_for_node(self._scene_xml[0], "CameraFormat")
             binning = camera_format_node.get("Binning")
             live_binning = camera_format_node.get("LiveBinning")
             if binning == "1" and live_binning == "1":
@@ -1054,10 +1047,10 @@ class Reader(reader.Reader):
             The formatted objective (e.g., "10x/0.30"). Returns None if not found.
         """
         try:
-            settings_node = self.scene_root.find(".//ATLCameraSettingDefinition")
+            settings_node = self._scene_xml[0].find(".//ATLCameraSettingDefinition")
             if settings_node is None:
                 settings_node = search_for_node(
-                    self.scene_root, "ATLConfocalSettingDefinition"
+                    self._scene_xml[0], "ATLConfocalSettingDefinition"
                 )
             objective_name = settings_node.get("ObjectiveName")
             if objective_name is None:
@@ -1082,7 +1075,7 @@ class Reader(reader.Reader):
         """
         try:
             # Parse timestamps
-            timestamp_list_node = search_for_node(self.scene_root, "TimeStampList")
+            timestamp_list_node = search_for_node(self._scene_xml[0], "TimeStampList")
             if timestamp_list_node is None or timestamp_list_node.text is None:
                 raise ValueError("TimeStampList node not found or contains no text.")
 
@@ -1101,7 +1094,7 @@ class Reader(reader.Reader):
             t = getattr(self.dims, "T", 1)
 
             images_per_timepoint = m * c * z
-            if self._scene_element is not self.scene_root:
+            if self._scene_xml[1]:
                 # FLIM dims count the derived maps, not the parent's channels
                 images_per_timepoint = len(timestamps) // t
             expected_total_timestamps = images_per_timepoint * t
@@ -1156,7 +1149,7 @@ class Reader(reader.Reader):
             Acquisition start time. Returns None if unavailable or malformed.
         """
         try:
-            timestamp_list_node = search_for_node(self.scene_root, "TimeStampList")
+            timestamp_list_node = search_for_node(self._scene_xml[0], "TimeStampList")
             if timestamp_list_node is None:
                 raise ValueError("TimeStampList node not found in metadata.")
             if timestamp_list_node.text is None:
