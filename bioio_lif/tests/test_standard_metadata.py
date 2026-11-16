@@ -35,6 +35,7 @@ def make_mock_reader(
 
         reader = Reader(image="dummy_path.lif")
         reader._metadata = metadata
+        reader._scenes = ("TileScan 1/B/2",)
         reader._dims = dimensions.Dimensions(dims, shape)
 
         return reader
@@ -102,3 +103,64 @@ def test_metadata_properties(
             assert result == expected, (
                 f"{property_name} expected {expected}, got {result}"
             )
+
+
+@pytest.mark.parametrize(
+    "scene, binning, imaging_datetime",
+    [
+        (
+            "flipt_actin_mannitol",
+            "2x2",
+            datetime.datetime(2026, 9, 30, 23, 20, 57, 732000),
+        ),
+        (
+            "flipt_actin_mannitol/FLIM",
+            "2x2",
+            datetime.datetime(2026, 9, 30, 23, 20, 57, 732000),
+        ),
+        (
+            "neg_ctrol",
+            "1x1",
+            datetime.datetime(2026, 9, 30, 23, 52, 27, 828001),
+        ),
+        (
+            "neg_ctrol/FLIM",
+            "1x1",
+            datetime.datetime(2026, 9, 30, 23, 52, 27, 828001),
+        ),
+    ],
+)
+def test_non_plate_flim_scene_metadata(
+    scene: str, binning: str, imaging_datetime: datetime.datetime
+) -> None:
+    reader = Reader(RESOURCE_DIR / "flim_multi_channel.lif")
+    reader.set_scene(scene)
+
+    assert reader.row is None
+    assert reader.column is None
+    assert reader.binning == binning
+    assert reader.objective == "HC PL APO CS2    40x/1.10 WATER"
+    assert reader.imaging_datetime == imaging_datetime
+
+
+def test_plate_scene_row_and_column_follow_scene_path() -> None:
+    reader = make_mock_reader(
+        metadata_file=RESOURCE_DIR / "sample_lif_metadata.xml",
+        dims="MTCZYX",
+        shape=(9, 49, 2, 1, 2048, 2048),
+    )
+    reader._scenes = ("TileScan 1/B/2", "TileScan 1/C/3")
+
+    reader._current_scene_index = 1
+
+    assert (reader.row, reader.column) == ("C", "3")
+    assert reader.scene_root.attrib["Name"] == "3"
+
+
+def test_flim_scene_duration_uses_parent_timestamps() -> None:
+    reader = Reader(RESOURCE_DIR / "flim_multi_channel.lif")
+    reader.set_scene("flipt_actin_mannitol/FLIM")
+
+    assert reader.total_time_duration == datetime.timedelta(
+        seconds=9, microseconds=456002
+    )
