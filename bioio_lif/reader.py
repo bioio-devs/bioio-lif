@@ -74,7 +74,7 @@ class Reader(reader.Reader):
     _metadata: Optional[Any] = None
     _physical_pixel_sizes: Optional[types.PhysicalPixelSizes] = None
     _scenes: Optional[Tuple[str, ...]] = None
-    _image_indices: List[int]
+    _image_indices_cache: Optional[List[int]] = None
     _current_scene_index: int = 0
     _tilescan: Optional[LifTileScanInfo] = None
     # Do not provide default value because
@@ -136,8 +136,9 @@ class Reader(reader.Reader):
         self._is_supported_image(self._fs, self._path)
 
     @property
-    def scenes(self) -> Tuple[str, ...]:
-        if self._scenes is None:
+    def _image_indices(self) -> List[int]:
+        """The file indices of the images that are scenes."""
+        if self._image_indices_cache is None:
             with self._fs.open(self._path) as open_resource:
                 with LifFile(open_resource) as lif:
                     # Images derived from a raw FLIM image are read through it
@@ -146,20 +147,27 @@ class Reader(reader.Reader):
                         for image in lif.images
                         if isinstance(image, LifFlimImage)
                     )
-                    self._image_indices = [
+                    self._image_indices_cache = [
                         index
                         for index, image in enumerate(lif.images)
                         if not image.path.startswith(flim_prefixes)
                     ]
+        return self._image_indices_cache
+
+    @property
+    def scenes(self) -> Tuple[str, ...]:
+        if self._scenes is None:
+            image_indices = self._image_indices
+            with self._fs.open(self._path) as open_resource:
+                with LifFile(open_resource) as lif:
                     self._scenes = tuple(
-                        lif.images[index].path for index in self._image_indices
+                        lif.images[index].path for index in image_indices
                     )
         return self._scenes
 
     @property
     def _image_index(self) -> int:
         """The index in the file of the current scene's image."""
-        self.scenes
         return self._image_indices[self.current_scene_index]
 
     @staticmethod
