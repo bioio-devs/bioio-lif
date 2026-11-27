@@ -16,8 +16,12 @@ def make_mock_reader(
     metadata_file: Path,
     dims: str,
     shape: tuple,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> Reader:
     metadata = ET.parse(metadata_file).getroot()
+    first_image = next(
+        el for el in metadata.iter("Element") if el.find("Data/Image") is not None
+    )
 
     with (
         patch("bioio_base.io.pathlike_to_fs") as mock_fs_patch,
@@ -28,7 +32,7 @@ def make_mock_reader(
         mock_fs_patch.return_value = (mock_fs, "dummy_path.lif")
 
         mock_lif = MagicMock()
-        mock_lif.images = [MagicMock(path="Scene_1")]
+        mock_lif.images = [MagicMock(path="Scene_1", xml_element=first_image)]
         mock_lif.xml_element = None
         mock_lif_patch.return_value = mock_lif
         mock_lif.__enter__.return_value = mock_lif
@@ -41,7 +45,10 @@ def make_mock_reader(
         reader._scene_xml_cache[0] = (scene_xml, False)
         reader._dims = dimensions.Dimensions(dims, shape)
 
-        return reader
+    # Keep serving the mocked file for properties that reopen it
+    monkeypatch.setattr("bioio_lif.reader.LifFile", lambda *args: mock_lif)
+
+    return reader
 
 
 @pytest.mark.parametrize(
@@ -78,7 +85,9 @@ def make_mock_reader(
     ],
 )
 def test_metadata_properties(
-    reader_source: Dict[str, Any], expected_values: Dict[str, Any]
+    reader_source: Dict[str, Any],
+    expected_values: Dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Setup reader
     if reader_source["type"] == "mock":
@@ -86,6 +95,7 @@ def test_metadata_properties(
             metadata_file=reader_source["metadata_file"],
             dims=reader_source["dims"],
             shape=reader_source["shape"],
+            monkeypatch=monkeypatch,
         )
     elif reader_source["type"] == "real":
         reader = Reader(reader_source["path"])
@@ -146,11 +156,14 @@ def test_non_plate_flim_scene_metadata(
     assert reader.imaging_datetime == imaging_datetime
 
 
-def test_plate_scene_row_and_column_follow_scene_path() -> None:
+def test_plate_scene_row_and_column_follow_scene_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     reader = make_mock_reader(
         metadata_file=RESOURCE_DIR / "sample_lif_metadata.xml",
         dims="MTCZYX",
         shape=(9, 49, 2, 1, 2048, 2048),
+        monkeypatch=monkeypatch,
     )
     reader._scenes = ("TileScan 1/B/2", "TileScan 1/C/3")
 
@@ -166,3 +179,18 @@ def test_flim_scene_duration_uses_parent_timestamps() -> None:
     assert reader.total_time_duration == datetime.timedelta(
         seconds=9, microseconds=456002
     )
+
+
+def test_imaging_datetime_is_per_scene() -> None:
+    # Each scene in this file was acquired a few minutes apart
+    reader = Reader(RESOURCE_DIR / "single_tile_scan.lif")
+    expected = [
+        datetime.datetime(2025, 11, 13, 18, 45, 29, 340000),
+        datetime.datetime(2025, 11, 13, 18, 48, 23, 900000),
+        datetime.datetime(2025, 11, 13, 18, 49, 26, 55000),
+    ]
+    for scene_index, expected_datetime in enumerate(expected):
+        reader.set_scene(scene_index)
+        result = reader.imaging_datetime
+        assert result is not None
+        assert abs(result - expected_datetime) < datetime.timedelta(milliseconds=1)
