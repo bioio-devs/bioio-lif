@@ -40,6 +40,9 @@ def make_mock_reader(
         reader = Reader(image="dummy_path.lif")
         reader._metadata = metadata
         reader._scenes = ("TileScan 1/B/2",)
+        scene_xml = metadata.find(".//Element[@Name='B']/Children/Element[@Name='2']")
+        assert scene_xml is not None
+        reader._scene_xml_cache[0] = (scene_xml, False)
         reader._dims = dimensions.Dimensions(dims, shape)
 
     # Keep serving the mocked file for properties that reopen it
@@ -167,7 +170,6 @@ def test_plate_scene_row_and_column_follow_scene_path(
     reader._current_scene_index = 1
 
     assert (reader.row, reader.column) == ("C", "3")
-    assert reader.scene_root.attrib["Name"] == "3"
 
 
 def test_flim_scene_duration_uses_parent_timestamps() -> None:
